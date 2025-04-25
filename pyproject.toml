@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+classifiers = ["Private :: Do Not Upload"]
+name = "utils"
+version = "0.1.0"
+description = "Add your description here"
+#readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+#    "notebook==7.3.3",
+#    "pandas==2.2.3",
+]
