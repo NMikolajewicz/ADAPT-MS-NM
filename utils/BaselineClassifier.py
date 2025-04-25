@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 
 
 class BaselineClassifier:
-    def __init__(self, prot_df, cat_df, gene_dict):
+    def __init__(self, prot_df, cat_df, gene_dict, between=None):
         # Ensure unique columns in the proteomics DataFrame
         self.prot_df = prot_df.loc[:, ~prot_df.columns.duplicated()]
         self.cat_df = cat_df
@@ -19,17 +19,20 @@ class BaselineClassifier:
         self.figures = []  # To store the figures for saving to a PDF
         self.models = []  # To store the trained models
         self.selectors = []  # To store feature selectors
+        self.between = between  
 
     def classify_and_plot(self, category1, category2, n_runs=10, n_estimators=200):
+        if self.between is None:
+            raise ValueError("The 'between' attribute must be set to a valid column name.")
         # Merge the dataframes on the index
         d_ML = self.prot_df.join(self.cat_df, how='inner')
 
         # Handle missing values using KNN Imputer
         imputer = KNNImputer(n_neighbors=5)
-        X = imputer.fit_transform(d_ML.drop(columns=['SRS']))
+        X = imputer.fit_transform(d_ML.drop(columns=[self.between]))
 
         # Separate features and target
-        y = d_ML['SRS']
+        y = d_ML[self.between]
 
         # Filter data to include only the specified categories
         filtered_indices = y.isin([category1, category2])
@@ -119,8 +122,8 @@ class BaselineClassifier:
 
         # Handle missing values
         imputer = KNNImputer(n_neighbors=5)
-        X_validation = imputer.fit_transform(validation_data.drop(columns=['SRS']))
-        y_validation = validation_data['SRS']
+        X_validation = imputer.fit_transform(validation_data.drop(columns=[self.between]))
+        y_validation = validation_data[self.between]
         y_validation = y_validation.map({category1: 0, category2: 1})
 
         # Ensure alignment of X_validation and y_validation
