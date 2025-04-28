@@ -12,21 +12,6 @@ import matplotlib.pyplot as plt
 from numpy import interp
 from matplotlib.backends.backend_pdf import PdfPages
 
-import os
-import pandas as pd
-import numpy as np
-from tqdm import tqdm
-from sklearn.model_selection import StratifiedKFold, train_test_split, cross_val_score
-from sklearn.impute import KNNImputer
-from sklearn.metrics import roc_curve, roc_auc_score
-from sklearn.linear_model import LogisticRegression
-from scipy.stats import ttest_ind
-from statsmodels.stats.multitest import multipletests
-import matplotlib.pyplot as plt
-from numpy import interp
-from matplotlib.backends.backend_pdf import PdfPages
-
-
 class AdaptmsClassifierDF:
     def __init__(self, prot_df, cat_df, gene_dict, between=None):
         self.prot_df = prot_df.loc[:, ~prot_df.columns.duplicated()]
@@ -218,7 +203,7 @@ class AdaptmsClassifierDF:
             print(f"Plots saved to {file_name}.")
 
 class AdaptmsClassifierFolder:
-    def __init__(self, prot_df, cat_df, gene_dict, between=None):
+    def __init__(self, prot_df, cat_df, gene_dict, between=None, cohort=None):
         self.prot_df = prot_df.loc[:, ~prot_df.columns.duplicated()]
         self.cat_df = cat_df
         self.gene_dict = gene_dict
@@ -230,6 +215,7 @@ class AdaptmsClassifierFolder:
         self.training_data = None  # Store training data
         self.training_targets = None  # Store training targets
         self.between = between
+        self.cohort = cohort  # select cohorts by substring of raws
 
     def classify_and_plot(self, category1, category2, n_runs=10, topn_features=50):
         if self.between is None:
@@ -358,19 +344,20 @@ class AdaptmsClassifierFolder:
     def classify_directory(self, directory, cat_validation_pool_SF, category1, category2):
         for file in os.listdir(directory):
             if file.endswith("mzML.pg_matrix.tsv"):
-                file_path = os.path.join(directory, file)
-                d_sample = pd.read_csv(file_path, sep='\t')
-                d_sample = d_sample.iloc[:, np.r_[0, 5]]
-                d_sample.columns = ['Protein.Group', d_sample.columns[1].split('/')[-1]]
-                d_sample = d_sample.set_index('Protein.Group')
-                d_sample = np.log10(d_sample)
-                d_sample = d_sample.T
-                sample_name = d_sample.index[0]
-                true_label = cat_validation_pool_SF.loc[sample_name][self.between]
-                if true_label in [category1, category2]:
-                    self.classify_sample(d_sample, true_label)
-                else:
-                    pass
+                if self.cohort is None or self.cohort in file:
+                    file_path = os.path.join(directory, file)
+                    d_sample = pd.read_csv(file_path, sep='\t')
+                    d_sample = d_sample.iloc[:, np.r_[0, 5]]
+                    d_sample.columns = ['Protein.Group', d_sample.columns[1].split('/')[-1]]
+                    d_sample = d_sample.set_index('Protein.Group')
+                    d_sample = np.log10(d_sample)
+                    d_sample = d_sample.T
+                    sample_name = d_sample.index[0]
+                    true_label = cat_validation_pool_SF.loc[sample_name][self.between]
+                    if true_label in [category1, category2]:
+                        self.classify_sample(d_sample, true_label)
+                    else:
+                        pass
 
     def plot_accumulated_roc(self, category1, category2):
         if not self.predictions:
