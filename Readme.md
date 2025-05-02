@@ -6,11 +6,6 @@
   <a href="https://github.com/othneildrew/Best-README-Template">
     <img src="data/Graphical_abstract.jpg" alt="Logo" width="800" height="560">
   </a>
-
-  <h3 align="center">ADAPT-MS</h3>
-
-  <p align="center">
-    <h3 align="center">Preprint</h3>
   </p>
 </div>
 
