@@ -136,3 +136,7 @@ cython_debug/
 .idea/
 
 data/**/*.pdf
+
+# Misc
+__pycache__/
+*.pyc
