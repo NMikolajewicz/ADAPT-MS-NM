@@ -4,7 +4,7 @@
 <br />
 <div align="center">
   <a href="https://github.com/othneildrew/Best-README-Template">
-    <img src="data/graphical_abstract.tiff" alt="Logo" width="800" height="800">
+    <img src="data/Graphical_abstract.tif" alt="Logo" width="800" height="800">
   </a>
 
   <h3 align="center">ADAPT-MS</h3>
