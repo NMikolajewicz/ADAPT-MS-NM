@@ -135,4 +135,12 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
 
+#specific files
 data/**/*.pdf
+data/Scivias_urine_pg.tsv
+data/Scivias_PCAN_proteins.tsv
+data/Scivias_urine_proteins.tsv
+data/Scivias_neat_pg.tsv
+data/Scivias_neat_proteins.tsv
+data/Scivias_PCAN_pg.tsv
+notebooks/20250316_ADAPT-MS_Scivias.ipynb
