@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 
 
 class BaselineClassifier:
-    def __init__(self, prot_df, cat_df, gene_dict, between=None):
+    def __init__(self, prot_df, cat_df, gene_dict=None, between=None):
         # Ensure unique columns in the proteomics DataFrame
         self.prot_df = prot_df.loc[:, ~prot_df.columns.duplicated()]
         self.cat_df = cat_df
@@ -19,19 +19,22 @@ class BaselineClassifier:
         self.figures = []  # To store the figures for saving to a PDF
         self.models = []  # To store the trained models
         self.selectors = []  # To store feature selectors
-        self.between = between  
+        self.imputers = []  # To store the imputers used for each run
+        self.between = between
+        self.feature_columns = None  # To store the feature columns used in training
 
     def classify_and_plot(self, category1, category2, n_runs=10, n_estimators=200):
         if self.between is None:
             raise ValueError("The 'between' attribute must be set to a valid column name.")
+        
         # Merge the dataframes on the index
         d_ML = self.prot_df.join(self.cat_df, how='inner')
-
-        # Handle missing values using KNN Imputer
-        imputer = KNNImputer(n_neighbors=5)
-        X = imputer.fit_transform(d_ML.drop(columns=[self.between]))
-
+        
+        # Store feature columns (excluding the target column)
+        self.feature_columns = [col for col in d_ML.columns if col != self.between]
+        
         # Separate features and target
+        X = d_ML[self.feature_columns].values
         y = d_ML[self.between]
 
         # Filter data to include only the specified categories
@@ -51,12 +54,20 @@ class BaselineClassifier:
             X_train, X_test, y_train, y_test = train_test_split(
                 X_filtered, y_filtered, test_size=0.2, stratify=y_filtered, random_state=i
             )
+            
+            # Handle missing values using KNN Imputer
+            imputer = KNNImputer(n_neighbors=5)
+            X_train_imputed = imputer.fit_transform(X_train)
+            X_test_imputed = imputer.transform(X_test)
+            
+            # Store the imputer for validation
+            self.imputers.append(imputer)
 
             # Feature selection using RandomForest for initial feature selection
             selector = SelectFromModel(RandomForestClassifier(n_estimators=n_estimators, random_state=i))
-            selector.fit(X_train, y_train)
-            X_train_selected = selector.transform(X_train)
-            X_test_selected = selector.transform(X_test)
+            selector.fit(X_train_imputed, y_train)
+            X_train_selected = selector.transform(X_train_imputed)
+            X_test_selected = selector.transform(X_test_imputed)
 
             # Initialize the XGBoost model
             model = XGBClassifier(eval_metric='logloss', random_state=i)
@@ -109,35 +120,42 @@ class BaselineClassifier:
     def validate_and_plot(self, validation_prot_df, validation_cat_df, category1, category2):
         if not self.models or not self.selectors:
             raise ValueError("No trained models available. Run 'classify_and_plot' first.")
+        
+        if self.feature_columns is None:
+            raise ValueError("Feature columns not set. Run 'classify_and_plot' first.")
 
         # Ensure unique columns in validation data
         validation_prot_df = validation_prot_df.loc[:, ~validation_prot_df.columns.duplicated()]
 
-        # Align validation features to match the training features
-        training_features = self.prot_df.columns
-        validation_prot_df = validation_prot_df.reindex(columns=training_features, fill_value=0)
-
         # Merge proteomics and metadata dataframes
         validation_data = validation_prot_df.join(validation_cat_df, how='inner')
-
-        # Handle missing values
-        imputer = KNNImputer(n_neighbors=5)
-        X_validation = imputer.fit_transform(validation_data.drop(columns=[self.between]))
+        
+        # Ensure validation data has the same features as training data
+        # Reindex to match training features, fill missing columns with NaN
+        validation_data = validation_data.reindex(columns=self.feature_columns + [self.between], fill_value=np.nan)
+        
+        # Extract features and target
+        X_validation = validation_data[self.feature_columns].values
         y_validation = validation_data[self.between]
+        
+        # Filter for the two categories
+        filtered_indices = y_validation.isin([category1, category2])
+        X_validation = X_validation[filtered_indices]
+        y_validation = y_validation[filtered_indices]
+        
+        # Encode the target variable
         y_validation = y_validation.map({category1: 0, category2: 1})
-
-        # Ensure alignment of X_validation and y_validation
-        mask = ~np.isnan(y_validation)
-        X_validation = X_validation[mask]
-        y_validation = y_validation[mask]
 
         mean_fpr = np.linspace(0, 1, 100)
         all_tprs = []
         aucs = []
 
-        for model, selector in zip(self.models, self.selectors):
+        for model, selector, imputer in zip(self.models, self.selectors, self.imputers):
+            # Apply the same imputer that was used during training
+            X_validation_imputed = imputer.transform(X_validation)
+            
             # Select features using the corresponding selector
-            X_validation_selected = selector.transform(X_validation)
+            X_validation_selected = selector.transform(X_validation_imputed)
 
             # Predict probabilities
             y_pred_prob = model.predict_proba(X_validation_selected)[:, 1]
@@ -167,8 +185,6 @@ class BaselineClassifier:
         self.figures.append(plt.gcf())
         plt.show()
 
-
-
     def save_plots_to_pdf(self, file_name):
         if not self.figures:
             print("No figures available. Run classification first.")
@@ -178,5 +194,3 @@ class BaselineClassifier:
             for fig in self.figures:
                 pdf.savefig(fig)
             print(f"Plots saved to {file_name}.")
-
-

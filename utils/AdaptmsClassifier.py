@@ -13,7 +13,7 @@ from numpy import interp
 from matplotlib.backends.backend_pdf import PdfPages
 
 class AdaptmsClassifierDF:
-    def __init__(self, prot_df, cat_df, gene_dict, between=None):
+    def __init__(self, prot_df, cat_df, gene_dict=None, between=None):
         self.prot_df = prot_df.loc[:, ~prot_df.columns.duplicated()]
         self.cat_df = cat_df
         self.gene_dict = gene_dict
@@ -160,14 +160,20 @@ class AdaptmsClassifierDF:
             available_features = list(self.selected_features.intersection(d_sample.columns))
             d_sample = d_sample[available_features]
 
-            true_label = validation_cat_df.loc[idx, self.between]
+            true_label_data = validation_cat_df.loc[idx, self.between]
+            if isinstance(true_label_data, pd.Series):
+                true_label = true_label_data.iloc[0]
+            elif isinstance(true_label_data, np.ndarray):
+                true_label = true_label_data[0]
+            else:
+                true_label = true_label_data
 
             # Re-train model using stored training data
             X_train_filtered = self.training_data[available_features].copy()
             y_train_filtered = self.training_targets.dropna()
             X_train_filtered = X_train_filtered.loc[y_train_filtered.index]
 
-            model = LogisticRegression(max_iter=1000).fit(X_train_filtered, y_train_filtered)
+            model = LogisticRegression(max_iter=2000).fit(X_train_filtered, y_train_filtered)
 
             # Predict probability for the sample
             prob = model.predict_proba(d_sample)[:, 1][0]
@@ -191,6 +197,53 @@ class AdaptmsClassifierDF:
         plt.legend(loc='lower right')
         self.figures.append(plt.gcf())
         plt.show()
+    def plot_confusion_matrix(self, category1, category2, normalize=True):
+        """
+        Plot confusion matrix for the validation predictions.
+        
+        Parameters:
+        -----------
+        category1 : label for class 0
+        category2 : label for class 1
+        normalize : bool, whether to normalize the confusion matrix
+        """
+        if not self.predictions:
+            raise ValueError("No predictions available. Run 'classify_dataframe' first.")
+        
+        from sklearn.metrics import confusion_matrix
+        import seaborn as sns
+        
+        # Extract predictions
+        sample_names, true_labels, pred_probs = zip(*self.predictions)
+        label_mapping = {category1: 0, category2: 1}
+        true_labels = np.array([label_mapping[label] for label in true_labels])
+        pred_probs = np.array(pred_probs)
+        
+        # Convert probabilities to binary predictions (threshold = 0.5)
+        pred_labels = (pred_probs > 0.5).astype(int)
+        
+        # Compute confusion matrix
+        cm = confusion_matrix(true_labels, pred_labels)
+        
+        if normalize:
+            cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+            fmt = '.2f'
+            title = 'Normalized Confusion Matrix'
+        else:
+            fmt = 'd'
+            title = 'Confusion Matrix'
+        
+        # Plot
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt=fmt, cmap='Blues', 
+                    xticklabels=[category1, category2],
+                    yticklabels=[category1, category2])
+        plt.title(title)
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        plt.tight_layout()
+        self.figures.append(plt.gcf())
+        plt.show()
 
     def save_plots_to_pdf(self, file_name):
         if not self.figures:
@@ -203,7 +256,7 @@ class AdaptmsClassifierDF:
             print(f"Plots saved to {file_name}.")
 
 class AdaptmsClassifierFolder:
-    def __init__(self, prot_df, cat_df, gene_dict, between=None, cohort=None):
+    def __init__(self, prot_df, cat_df, gene_dict=None, between=None, cohort=None):
         self.prot_df = prot_df.loc[:, ~prot_df.columns.duplicated()]
         self.cat_df = cat_df
         self.gene_dict = gene_dict
