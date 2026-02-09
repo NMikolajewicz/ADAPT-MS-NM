@@ -25,6 +25,15 @@ library(VIM)
 source(file.path(here::here(), "R", "AdaptmsClassifier.R"))
 source(file.path(here::here(), "R", "BaselineClassifier.R"))
 source(file.path(here::here(), "R", "NonValClassifier.R"))
+
+sanitize_row_ids <- function(x, prefix = "row") {
+  ids <- trimws(as.character(x))
+  missing <- is.na(ids) | ids == ""
+  if (any(missing)) {
+    ids[missing] <- paste0(prefix, "_", seq_len(sum(missing)))
+  }
+  make.unique(ids)
+}
 ```
 
 # 2. Load Proteomics Data
@@ -44,7 +53,7 @@ gene_dict <- setNames(df$Genes, df$Protein.Group)
 
 # Extract protein intensity matrix (skip first 5 metadata columns)
 prot <- df[, -(1:5), drop = FALSE]
-rownames(prot) <- df$Protein.Group
+rownames(prot) <- sanitize_row_ids(df$Protein.Group, prefix = "protein_group")
 
 # Transpose: samples as rows, proteins as columns
 prot <- as.data.frame(t(prot))
@@ -55,6 +64,7 @@ rownames(prot) <- sapply(rownames(prot), function(x) {
   fname <- parts[length(parts)]
   sub("\\..*$", "", fname)
 })
+rownames(prot) <- sanitize_row_ids(rownames(prot), prefix = "sample")
 
 # Log10 transform, replacing 0 with NA
 prot[prot == 0] <- NA
@@ -70,7 +80,7 @@ cat("Proteins:", ncol(prot), "\n")
 d_groups <- as.data.frame(
   read_excel(file.path(data_path, "annotation of samples_AM1.5.11.xlsx"))
 )
-rownames(d_groups) <- d_groups$`sample name`
+rownames(d_groups) <- sanitize_row_ids(d_groups$`sample name`, prefix = "sample_name")
 
 cat <- d_groups[, "biochemical AD classification", drop = FALSE]
 

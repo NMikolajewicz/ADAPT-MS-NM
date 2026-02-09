@@ -42,6 +42,15 @@ library(VIM)
   cm_norm
 }
 
+.sanitize_row_ids <- function(x, prefix = "row") {
+  ids <- trimws(as.character(x))
+  missing <- is.na(ids) | ids == ""
+  if (any(missing)) {
+    ids[missing] <- paste0(prefix, "_", seq_len(sum(missing)))
+  }
+  make.unique(ids)
+}
+
 # -----------------------------------------------------------------------------
 # AdaptmsClassifierDF
 # For validating against a data.frame of samples
@@ -568,7 +577,7 @@ AdaptmsClassifierFolder <- setRefClass(
         d_sample <- d_sample[, c(1, 6), drop = FALSE]
         sample_col_name <- basename(sub(".*/", "", colnames(d_sample)[2]))
         colnames(d_sample) <- c("Protein.Group", sample_col_name)
-        rownames(d_sample) <- d_sample$Protein.Group
+        rownames(d_sample) <- .sanitize_row_ids(d_sample$Protein.Group, prefix = "protein_group")
         d_sample$Protein.Group <- NULL
 
         # Log10 transform with robust handling of non-positive values.

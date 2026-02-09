@@ -27,6 +27,15 @@ source(file.path(here::here(), "R", "AdaptmsClassifier.R"))
 source(file.path(here::here(), "R", "BaselineClassifier.R"))
 source(file.path(here::here(), "R", "XGBfillClassifier.R"))
 source(file.path(here::here(), "R", "AdaptmsMultiClassifier.R"))
+
+sanitize_row_ids <- function(x, prefix = "row") {
+  ids <- trimws(as.character(x))
+  missing <- is.na(ids) | ids == ""
+  if (any(missing)) {
+    ids[missing] <- paste0(prefix, "_", seq_len(sum(missing)))
+  }
+  make.unique(ids)
+}
 ```
 
 # 2. Load Sepsis Proteomics Data
@@ -54,7 +63,7 @@ cat("Metadata samples:", nrow(d_cat), "\n")
 gene_dict <- setNames(df$Genes, df$Protein.Group)
 
 prot <- df[, -(1:5), drop = FALSE]
-rownames(prot) <- df$Protein.Group
+rownames(prot) <- sanitize_row_ids(df$Protein.Group, prefix = "protein_group")
 prot <- as.data.frame(t(prot))
 
 # Clean sample names from Injection column format
@@ -63,13 +72,14 @@ rownames(prot) <- sapply(rownames(prot), function(x) {
   fname <- parts[length(parts)]
   sub("\\..*$", "", fname)
 })
+rownames(prot) <- sanitize_row_ids(rownames(prot), prefix = "sample")
 
 # Log10 transform, zeros become NA
 prot[prot == 0] <- NA
 prot <- log10(prot)
 
 # Set up metadata with matching row names
-rownames(d_cat) <- as.character(d_cat$Injection)
+rownames(d_cat) <- sanitize_row_ids(d_cat$Injection, prefix = "injection")
 
 cat("Processed samples:", nrow(prot), "\n")
 cat("Processed proteins:", ncol(prot), "\n")

@@ -32,6 +32,15 @@ library(VIM)
   list(true_numeric = true_numeric, pred_probs = pred_probs)
 }
 
+.sanitize_row_ids_xgb <- function(x, prefix = "row") {
+  ids <- trimws(as.character(x))
+  missing <- is.na(ids) | ids == ""
+  if (any(missing)) {
+    ids[missing] <- paste0(prefix, "_", seq_len(sum(missing)))
+  }
+  make.unique(ids)
+}
+
 # -----------------------------------------------------------------------------
 # XGBRFClassifierDF
 # DataFrame-based variant
@@ -560,7 +569,7 @@ XGBRFClassifierFolder <- setRefClass(
         d_sample <- d_sample[, c(1, 6), drop = FALSE]
         sample_col_name <- basename(sub(".*/", "", colnames(d_sample)[2]))
         colnames(d_sample) <- c("Protein.Group", sample_col_name)
-        rownames(d_sample) <- d_sample$Protein.Group
+        rownames(d_sample) <- .sanitize_row_ids_xgb(d_sample$Protein.Group, prefix = "protein_group")
         d_sample$Protein.Group <- NULL
 
         d_sample[] <- lapply(d_sample, function(x) {

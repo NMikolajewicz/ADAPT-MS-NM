@@ -24,6 +24,15 @@ library(ggplot2)
 source(file.path(here::here(), "R", "AdaptmsClassifier.R"))
 source(file.path(here::here(), "R", "BaselineClassifier.R"))
 source(file.path(here::here(), "R", "NonRefitClassifier.R"))
+
+sanitize_row_ids <- function(x, prefix = "row") {
+  ids <- trimws(as.character(x))
+  missing <- is.na(ids) | ids == ""
+  if (any(missing)) {
+    ids[missing] <- paste0(prefix, "_", seq_len(sum(missing)))
+  }
+  make.unique(ids)
+}
 ```
 
 # 2. Load Data
@@ -42,13 +51,14 @@ df_train <- read.delim(
 gene_dict <- setNames(df_train$Genes, df_train$Protein.Group)
 
 prot_train <- df_train[, -(1:5), drop = FALSE]
-rownames(prot_train) <- df_train$Protein.Group
+rownames(prot_train) <- sanitize_row_ids(df_train$Protein.Group, prefix = "protein_group")
 prot_train <- as.data.frame(t(prot_train))
 
 rownames(prot_train) <- sapply(rownames(prot_train), function(x) {
   parts <- strsplit(x, "/")[[1]]
   sub("\\..*$", "", parts[length(parts)])
 })
+rownames(prot_train) <- sanitize_row_ids(rownames(prot_train), prefix = "sample")
 
 prot_train[prot_train == 0] <- NA
 prot_train <- log10(prot_train)
@@ -65,13 +75,14 @@ df_val <- read.delim(
 )
 
 prot_val <- df_val[, -(1:5), drop = FALSE]
-rownames(prot_val) <- df_val$Protein.Group
+rownames(prot_val) <- sanitize_row_ids(df_val$Protein.Group, prefix = "protein_group")
 prot_val <- as.data.frame(t(prot_val))
 
 rownames(prot_val) <- sapply(rownames(prot_val), function(x) {
   parts <- strsplit(x, "/")[[1]]
   sub("\\..*$", "", parts[length(parts)])
 })
+rownames(prot_val) <- sanitize_row_ids(rownames(prot_val), prefix = "sample")
 
 prot_val[prot_val == 0] <- NA
 prot_val <- log10(prot_val)
@@ -85,7 +96,7 @@ cat("Validation samples:", nrow(prot_val), "\n")
 d_groups <- as.data.frame(
   read_excel(file.path(data_path, "annotation of samples_AM1.5.11.xlsx"))
 )
-rownames(d_groups) <- d_groups$`sample name`
+rownames(d_groups) <- sanitize_row_ids(d_groups$`sample name`, prefix = "sample_name")
 
 cat_all <- d_groups[, "biochemical AD classification", drop = FALSE]
 
