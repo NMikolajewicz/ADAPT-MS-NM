@@ -104,6 +104,21 @@ XGBRFClassifierDF <- setRefClass(
       X_filtered <- X_raw[keep, , drop = FALSE]
       y_filtered <- ifelse(y[keep] == category1, 0, 1)
       names(y_filtered) <- rownames(X_filtered)
+      class_counts <- table(factor(y[keep], levels = c(category1, category2)))
+
+      if (length(y_filtered) < 2) {
+        stop(sprintf(
+          "Need at least 2 samples after filtering '%s' for '%s' vs '%s' (found %d).",
+          between, category1, category2, length(y_filtered)
+        ))
+      }
+      if (any(class_counts == 0)) {
+        stop(sprintf(
+          "Both classes must be present after filtering '%s' for '%s' vs '%s'. Counts: %s",
+          between, category1, category2,
+          paste(sprintf("%s=%d", names(class_counts), as.integer(class_counts)), collapse = ", ")
+        ))
+      }
 
       training_data <<- X_filtered
       training_targets <<- y_filtered
@@ -118,7 +133,8 @@ XGBRFClassifierDF <- setRefClass(
 
       for (i in seq_len(n_runs)) {
         set.seed(i - 1)
-        train_idx <- createDataPartition(y_filtered, p = 0.8, list = FALSE)[, 1]
+        train_idx <- createDataPartition(factor(y_filtered, levels = c(0, 1)),
+                                         p = 0.8, list = FALSE)[, 1]
 
         X_train_imp <- as.matrix(X_imputed[train_idx, , drop = FALSE])
         X_test_imp  <- as.matrix(X_imputed[-train_idx, , drop = FALSE])
@@ -400,6 +416,21 @@ XGBRFClassifierFolder <- setRefClass(
       X_filtered <- X_raw[keep, , drop = FALSE]
       y_filtered <- ifelse(y[keep] == category1, 0, 1)
       names(y_filtered) <- rownames(X_filtered)
+      class_counts <- table(factor(y[keep], levels = c(category1, category2)))
+
+      if (length(y_filtered) < 2) {
+        stop(sprintf(
+          "Need at least 2 samples after filtering '%s' for '%s' vs '%s' (found %d).",
+          between, category1, category2, length(y_filtered)
+        ))
+      }
+      if (any(class_counts == 0)) {
+        stop(sprintf(
+          "Both classes must be present after filtering '%s' for '%s' vs '%s'. Counts: %s",
+          between, category1, category2,
+          paste(sprintf("%s=%d", names(class_counts), as.integer(class_counts)), collapse = ", ")
+        ))
+      }
 
       training_data <<- X_filtered
       training_targets <<- y_filtered
@@ -420,7 +451,8 @@ XGBRFClassifierFolder <- setRefClass(
 
       for (i in seq_len(n_runs)) {
         set.seed(i - 1)
-        train_idx <- createDataPartition(y_filtered, p = 0.8, list = FALSE)[, 1]
+        train_idx <- createDataPartition(factor(y_filtered, levels = c(0, 1)),
+                                         p = 0.8, list = FALSE)[, 1]
 
         X_train_imp <- as.matrix(X_imputed[train_idx, , drop = FALSE])
         X_train_raw <- X_filtered[train_idx, , drop = FALSE]

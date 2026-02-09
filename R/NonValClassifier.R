@@ -62,6 +62,21 @@ NonValClassifier <- setRefClass(
       keep <- y %in% c(category1, category2)
       X_filtered <- X[keep, , drop = FALSE]
       y_filtered <- ifelse(y[keep] == category1, 0, 1)
+      class_counts <- table(factor(y[keep], levels = c(category1, category2)))
+
+      if (length(y_filtered) < 2) {
+        stop(sprintf(
+          "Need at least 2 samples after filtering '%s' for '%s' vs '%s' (found %d).",
+          between, category1, category2, length(y_filtered)
+        ))
+      }
+      if (any(class_counts == 0)) {
+        stop(sprintf(
+          "Both classes must be present after filtering '%s' for '%s' vs '%s'. Counts: %s",
+          between, category1, category2,
+          paste(sprintf("%s=%d", names(class_counts), as.integer(class_counts)), collapse = ", ")
+        ))
+      }
 
       test_aucs <- numeric(0)
       all_test_fprs <- list()
@@ -72,7 +87,8 @@ NonValClassifier <- setRefClass(
 
         random_state <- 42 + repeat_i - 1
         set.seed(random_state)
-        train_idx <- createDataPartition(y_filtered, p = 0.8, list = FALSE)[, 1]
+        train_idx <- createDataPartition(factor(y_filtered, levels = c(0, 1)),
+                                         p = 0.8, list = FALSE)[, 1]
 
         X_train <- X_filtered[train_idx, , drop = FALSE]
         X_test  <- X_filtered[-train_idx, , drop = FALSE]

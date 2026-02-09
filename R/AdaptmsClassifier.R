@@ -110,6 +110,21 @@ AdaptmsClassifierDF <- setRefClass(
       X_filtered <- X_raw[keep, , drop = FALSE]
       y_filtered <- ifelse(y[keep] == category1, 0, 1)
       names(y_filtered) <- rownames(X_filtered)
+      class_counts <- table(factor(y[keep], levels = c(category1, category2)))
+
+      if (length(y_filtered) < 2) {
+        stop(sprintf(
+          "Need at least 2 samples after filtering '%s' for '%s' vs '%s' (found %d).",
+          between, category1, category2, length(y_filtered)
+        ))
+      }
+      if (any(class_counts == 0)) {
+        stop(sprintf(
+          "Both classes must be present after filtering '%s' for '%s' vs '%s'. Counts: %s",
+          between, category1, category2,
+          paste(sprintf("%s=%d", names(class_counts), as.integer(class_counts)), collapse = ", ")
+        ))
+      }
 
       # KNN impute the filtered data
       X_imputed <- as.data.frame(kNN(X_filtered, k = 5, imp_var = FALSE))
@@ -125,7 +140,8 @@ AdaptmsClassifierDF <- setRefClass(
 
       for (i in seq_len(n_runs)) {
         set.seed(i - 1)
-        train_idx <- createDataPartition(y_filtered, p = 0.8, list = FALSE)[, 1]
+        train_idx <- createDataPartition(factor(y_filtered, levels = c(0, 1)),
+                                         p = 0.8, list = FALSE)[, 1]
         X_train_raw <- X_filtered[train_idx, , drop = FALSE]
         X_test_raw  <- X_filtered[-train_idx, , drop = FALSE]
         y_train <- y_filtered[train_idx]
@@ -425,6 +441,21 @@ AdaptmsClassifierFolder <- setRefClass(
       X_filt_imp   <- X_imputed[keep, , drop = FALSE]
       y_filt <- ifelse(y[keep] == category1, 0, 1)
       names(y_filt) <- rownames(X_filt_unimp)
+      class_counts <- table(factor(y[keep], levels = c(category1, category2)))
+
+      if (length(y_filt) < 2) {
+        stop(sprintf(
+          "Need at least 2 samples after filtering '%s' for '%s' vs '%s' (found %d).",
+          between, category1, category2, length(y_filt)
+        ))
+      }
+      if (any(class_counts == 0)) {
+        stop(sprintf(
+          "Both classes must be present after filtering '%s' for '%s' vs '%s'. Counts: %s",
+          between, category1, category2,
+          paste(sprintf("%s=%d", names(class_counts), as.integer(class_counts)), collapse = ", ")
+        ))
+      }
 
       training_data <<- X_filt_imp
       training_targets <<- y_filt
@@ -435,7 +466,8 @@ AdaptmsClassifierFolder <- setRefClass(
 
       for (i in seq_len(n_runs)) {
         set.seed(i - 1)
-        train_idx <- createDataPartition(y_filt, p = 0.8, list = FALSE)[, 1]
+        train_idx <- createDataPartition(factor(y_filt, levels = c(0, 1)),
+                                         p = 0.8, list = FALSE)[, 1]
 
         X_train_unimp <- X_filt_unimp[train_idx, , drop = FALSE]
         X_train_imp   <- X_filt_imp[train_idx, , drop = FALSE]

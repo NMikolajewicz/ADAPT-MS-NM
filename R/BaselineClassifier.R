@@ -75,6 +75,21 @@ BaselineClassifier <- setRefClass(
       X_filtered <- X[keep, , drop = FALSE]
       y_filtered <- ifelse(y[keep] == category1, 0, 1)
       names(y_filtered) <- rownames(X_filtered)
+      class_counts <- table(factor(y[keep], levels = c(category1, category2)))
+
+      if (length(y_filtered) < 2) {
+        stop(sprintf(
+          "Need at least 2 samples after filtering '%s' for '%s' vs '%s' (found %d).",
+          between, category1, category2, length(y_filtered)
+        ))
+      }
+      if (any(class_counts == 0)) {
+        stop(sprintf(
+          "Both classes must be present after filtering '%s' for '%s' vs '%s'. Counts: %s",
+          between, category1, category2,
+          paste(sprintf("%s=%d", names(class_counts), as.integer(class_counts)), collapse = ", ")
+        ))
+      }
 
       mean_fpr <- seq(0, 1, length.out = 100)
       all_tprs <- matrix(nrow = 0, ncol = 100)
@@ -82,7 +97,8 @@ BaselineClassifier <- setRefClass(
 
       for (i in seq_len(n_runs)) {
         set.seed(i - 1)
-        train_idx <- createDataPartition(y_filtered, p = 0.8, list = FALSE)[, 1]
+        train_idx <- createDataPartition(factor(y_filtered, levels = c(0, 1)),
+                                         p = 0.8, list = FALSE)[, 1]
         X_train <- X_filtered[train_idx, , drop = FALSE]
         X_test  <- X_filtered[-train_idx, , drop = FALSE]
         y_train <- y_filtered[train_idx]

@@ -100,6 +100,21 @@ AdaptmsMulticlassClassifier <- setRefClass(
 
       training_targets <<- y_original
       label_levels <<- sort(unique(y_original))
+      class_counts <- table(y_original)
+
+      if (length(y_original) < 2) {
+        stop(sprintf(
+          "Need at least 2 samples after filtering '%s' (found %d).",
+          between_column, length(y_original)
+        ))
+      }
+      if (length(label_levels) < 2) {
+        stop(sprintf(
+          "Need at least 2 classes in '%s' for stratified splitting. Counts: %s",
+          between_column,
+          paste(sprintf("%s=%d", names(class_counts), as.integer(class_counts)), collapse = ", ")
+        ))
+      }
 
       # KNN impute
       X_raw <- d_ML[, colnames(d_ML) != between_column, drop = FALSE]
