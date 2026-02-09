@@ -9,6 +9,39 @@ library(caret)
 library(pROC)
 library(VIM)
 
+.prepare_binary_eval <- function(predictions, category1, category2, context) {
+  true_labels <- sapply(predictions, function(x) as.character(x$true_label))
+  pred_probs <- as.numeric(sapply(predictions, function(x) x$prob))
+
+  keep <- true_labels %in% c(category1, category2) & !is.na(pred_probs)
+  if (!any(keep)) {
+    stop(sprintf("No usable %s predictions found for categories '%s' and '%s'.",
+                 context, category1, category2))
+  }
+
+  true_labels <- true_labels[keep]
+  pred_probs <- pred_probs[keep]
+  true_numeric <- ifelse(true_labels == category1, 0L, 1L)
+
+  if (length(unique(true_numeric)) < 2) {
+    stop(sprintf("Need predictions from both '%s' and '%s' to compute ROC.",
+                 category1, category2))
+  }
+
+  list(true_numeric = true_numeric, pred_probs = pred_probs)
+}
+
+.normalize_confusion_matrix <- function(cm) {
+  rs <- rowSums(cm)
+  cm_norm <- matrix(0, nrow = nrow(cm), ncol = ncol(cm),
+                    dimnames = dimnames(cm))
+  valid_rows <- rs > 0
+  if (any(valid_rows)) {
+    cm_norm[valid_rows, ] <- cm[valid_rows, , drop = FALSE] / rs[valid_rows]
+  }
+  cm_norm
+}
+
 # -----------------------------------------------------------------------------
 # AdaptmsClassifierDF
 # For validating against a data.frame of samples
@@ -193,6 +226,7 @@ AdaptmsClassifierDF <- setRefClass(
         row_data <- validation_df[idx, , drop = FALSE]
         non_na_cols <- colnames(row_data)[!is.na(row_data[1, ])]
         available_features <- intersect(.self$selected_features, non_na_cols)
+        if (length(available_features) < 2) next
         d_sample <- row_data[, available_features, drop = FALSE]
 
         true_label <- validation_cat_df[idx, between]
@@ -226,12 +260,15 @@ AdaptmsClassifierDF <- setRefClass(
         stop("No predictions available. Run 'classify_dataframe' first.")
       }
 
-      true_labels <- sapply(predictions, function(x) x$true_label)
-      pred_probs  <- sapply(predictions, function(x) x$prob)
-      label_map <- c(setNames(0, category1), setNames(1, category2))
-      true_numeric <- label_map[true_labels]
-
-      roc_obj <- roc(true_numeric, pred_probs, quiet = TRUE)
+      eval_data <- tryCatch(
+        .prepare_binary_eval(predictions, category1, category2, "validation"),
+        error = function(e) {
+          message(conditionMessage(e))
+          NULL
+        }
+      )
+      if (is.null(eval_data)) return(invisible(NULL))
+      roc_obj <- roc(eval_data$true_numeric, eval_data$pred_probs, quiet = TRUE)
       auc_val <- as.numeric(auc(roc_obj))
 
       plot_df <- data.frame(fpr = 1 - roc_obj$specificities,
@@ -256,17 +293,22 @@ AdaptmsClassifierDF <- setRefClass(
         stop("No predictions available. Run 'classify_dataframe' first.")
       }
 
-      true_labels <- sapply(predictions, function(x) x$true_label)
-      pred_probs  <- sapply(predictions, function(x) x$prob)
-      label_map <- c(setNames(0, category1), setNames(1, category2))
-      true_numeric <- label_map[true_labels]
-      pred_labels <- ifelse(pred_probs > 0.5, 1, 0)
+      eval_data <- tryCatch(
+        .prepare_binary_eval(predictions, category1, category2, "validation"),
+        error = function(e) {
+          message(conditionMessage(e))
+          NULL
+        }
+      )
+      if (is.null(eval_data)) return(invisible(NULL))
+      true_numeric <- eval_data$true_numeric
+      pred_labels <- ifelse(eval_data$pred_probs > 0.5, 1, 0)
 
       cm <- table(True = factor(true_numeric, levels = c(0, 1)),
                   Predicted = factor(pred_labels, levels = c(0, 1)))
 
       if (normalize) {
-        cm_norm <- sweep(cm, 1, rowSums(cm), "/")
+        cm_norm <- .normalize_confusion_matrix(cm)
         cm_df <- as.data.frame(as.table(cm_norm))
         fmt_label <- "Proportion"
         title_txt <- "Normalized Confusion Matrix"
@@ -492,6 +534,7 @@ AdaptmsClassifierFolder <- setRefClass(
       }
 
       available_features <- intersect(.self$selected_features, colnames(d_sample))
+      if (length(available_features) < 2) return(invisible(NULL))
       d_sample_filt <- d_sample[, available_features, drop = FALSE]
       d_sample_filt[is.na(d_sample_filt)] <- 0
 
@@ -528,8 +571,12 @@ AdaptmsClassifierFolder <- setRefClass(
         rownames(d_sample) <- d_sample$Protein.Group
         d_sample$Protein.Group <- NULL
 
-        # Log10 transform
-        d_sample[] <- log10(d_sample)
+        # Log10 transform with robust handling of non-positive values.
+        d_sample[] <- lapply(d_sample, function(x) {
+          x <- suppressWarnings(as.numeric(x))
+          x[x <= 0] <- NA_real_
+          log10(x)
+        })
 
         # Transpose: 1 row = 1 sample
         d_sample <- as.data.frame(t(d_sample))
@@ -549,12 +596,15 @@ AdaptmsClassifierFolder <- setRefClass(
         stop("No predictions available. Run 'classify_directory' first.")
       }
 
-      true_labels <- sapply(predictions, function(x) x$true_label)
-      pred_probs  <- sapply(predictions, function(x) x$prob)
-      label_map <- c(setNames(0, category1), setNames(1, category2))
-      true_numeric <- label_map[true_labels]
-
-      roc_obj <- roc(true_numeric, pred_probs, quiet = TRUE)
+      eval_data <- tryCatch(
+        .prepare_binary_eval(predictions, category1, category2, "directory"),
+        error = function(e) {
+          message(conditionMessage(e))
+          NULL
+        }
+      )
+      if (is.null(eval_data)) return(invisible(NULL))
+      roc_obj <- roc(eval_data$true_numeric, eval_data$pred_probs, quiet = TRUE)
       auc_val <- as.numeric(auc(roc_obj))
 
       plot_df <- data.frame(fpr = 1 - roc_obj$specificities,

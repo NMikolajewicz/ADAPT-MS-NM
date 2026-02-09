@@ -10,6 +10,19 @@ library(caret)
 library(pROC)
 library(VIM)
 
+.interp_tpr_on_grid <- function(fpr, tpr, mean_fpr) {
+  ord <- order(fpr, tpr)
+  fpr_sorted <- fpr[ord]
+  tpr_sorted <- tpr[ord]
+  keep <- !duplicated(fpr_sorted)
+  if (sum(keep) < 2) {
+    return(NULL)
+  }
+  interp_tpr <- approx(fpr_sorted[keep], tpr_sorted[keep], xout = mean_fpr, rule = 2)$y
+  interp_tpr[1] <- 0
+  interp_tpr
+}
+
 NonValClassifier <- setRefClass(
   "NonValClassifier",
   fields = list(
@@ -103,21 +116,34 @@ NonValClassifier <- setRefClass(
         }
       }
 
+      if (length(test_aucs) == 0) {
+        stop("No valid ROC/AUC values were produced. Check that both classes are present in each split.")
+      }
+
       # Calculate mean AUC and 95% CI
       mean_auc <- mean(test_aucs, na.rm = TRUE)
-      se_auc   <- sd(test_aucs, na.rm = TRUE) / sqrt(length(test_aucs))
-      ci_lower <- mean_auc - qt(0.975, df = length(test_aucs) - 1) * se_auc
-      ci_upper <- mean_auc + qt(0.975, df = length(test_aucs) - 1) * se_auc
+      if (length(test_aucs) > 1) {
+        se_auc   <- sd(test_aucs, na.rm = TRUE) / sqrt(length(test_aucs))
+        ci_lower <- mean_auc - qt(0.975, df = length(test_aucs) - 1) * se_auc
+        ci_upper <- mean_auc + qt(0.975, df = length(test_aucs) - 1) * se_auc
+      } else {
+        ci_lower <- mean_auc
+        ci_upper <- mean_auc
+      }
 
       # Interpolate all ROC curves to common FPR axis
       mean_fpr <- seq(0, 1, length.out = 100)
       interp_tprs <- matrix(nrow = 0, ncol = 100)
 
       for (k in seq_along(all_test_fprs)) {
-        interp_tpr <- approx(all_test_fprs[[k]], all_test_tprs[[k]],
-                              xout = mean_fpr, rule = 2)$y
-        interp_tpr[1] <- 0
-        interp_tprs <- rbind(interp_tprs, interp_tpr)
+        interp_tpr <- .interp_tpr_on_grid(all_test_fprs[[k]], all_test_tprs[[k]], mean_fpr)
+        if (!is.null(interp_tpr)) {
+          interp_tprs <- rbind(interp_tprs, interp_tpr)
+        }
+      }
+
+      if (nrow(interp_tprs) == 0) {
+        stop("Unable to build aggregated ROC curve because interpolation failed for all runs.")
       }
 
       mean_tpr <- colMeans(interp_tprs)

@@ -10,6 +10,28 @@ library(caret)
 library(pROC)
 library(VIM)
 
+.prepare_binary_eval_xgb <- function(predictions, category1, category2, context) {
+  true_labels <- sapply(predictions, function(x) as.character(x$true_label))
+  pred_probs <- as.numeric(sapply(predictions, function(x) x$prob))
+
+  keep <- true_labels %in% c(category1, category2) & !is.na(pred_probs)
+  if (!any(keep)) {
+    stop(sprintf("No usable %s predictions found for categories '%s' and '%s'.",
+                 context, category1, category2))
+  }
+
+  true_labels <- true_labels[keep]
+  pred_probs <- pred_probs[keep]
+  true_numeric <- ifelse(true_labels == category1, 0L, 1L)
+
+  if (length(unique(true_numeric)) < 2) {
+    stop(sprintf("Need predictions from both '%s' and '%s' to compute ROC.",
+                 category1, category2))
+  }
+
+  list(true_numeric = true_numeric, pred_probs = pred_probs)
+}
+
 # -----------------------------------------------------------------------------
 # XGBRFClassifierDF
 # DataFrame-based variant
@@ -255,12 +277,15 @@ XGBRFClassifierDF <- setRefClass(
         stop("No predictions available. Run 'classify_dataframe' first.")
       }
 
-      true_labels <- sapply(predictions, function(x) x$true_label)
-      pred_probs  <- sapply(predictions, function(x) x$prob)
-      label_map <- c(setNames(0, category1), setNames(1, category2))
-      true_numeric <- label_map[true_labels]
-
-      roc_obj <- roc(true_numeric, pred_probs, quiet = TRUE)
+      eval_data <- tryCatch(
+        .prepare_binary_eval_xgb(predictions, category1, category2, "validation"),
+        error = function(e) {
+          message(conditionMessage(e))
+          NULL
+        }
+      )
+      if (is.null(eval_data)) return(invisible(NULL))
+      roc_obj <- roc(eval_data$true_numeric, eval_data$pred_probs, quiet = TRUE)
       auc_val <- as.numeric(auc(roc_obj))
 
       plot_df <- data.frame(fpr = 1 - roc_obj$specificities,
@@ -498,6 +523,8 @@ XGBRFClassifierFolder <- setRefClass(
         stop("No trained model available. Run 'classify_and_plot' first.")
       }
 
+      if (length(selected_features) == 0) return(invisible(NULL))
+
       d_sample_aligned <- data.frame(matrix(NA_real_, nrow = 1, ncol = length(selected_features)))
       colnames(d_sample_aligned) <- selected_features
       rownames(d_sample_aligned) <- rownames(d_sample)[1]
@@ -536,7 +563,11 @@ XGBRFClassifierFolder <- setRefClass(
         rownames(d_sample) <- d_sample$Protein.Group
         d_sample$Protein.Group <- NULL
 
-        d_sample[] <- log10(d_sample)
+        d_sample[] <- lapply(d_sample, function(x) {
+          x <- suppressWarnings(as.numeric(x))
+          x[x <= 0] <- NA_real_
+          log10(x)
+        })
         d_sample <- as.data.frame(t(d_sample))
         sample_name <- rownames(d_sample)[1]
 
@@ -556,12 +587,15 @@ XGBRFClassifierFolder <- setRefClass(
         stop("No predictions available. Run 'classify_directory' first.")
       }
 
-      true_labels <- sapply(predictions, function(x) x$true_label)
-      pred_probs  <- sapply(predictions, function(x) x$prob)
-      label_map <- c(setNames(0, category1), setNames(1, category2))
-      true_numeric <- label_map[true_labels]
-
-      roc_obj <- roc(true_numeric, pred_probs, quiet = TRUE)
+      eval_data <- tryCatch(
+        .prepare_binary_eval_xgb(predictions, category1, category2, "directory"),
+        error = function(e) {
+          message(conditionMessage(e))
+          NULL
+        }
+      )
+      if (is.null(eval_data)) return(invisible(NULL))
+      roc_obj <- roc(eval_data$true_numeric, eval_data$pred_probs, quiet = TRUE)
       auc_val <- as.numeric(auc(roc_obj))
 
       plot_df <- data.frame(fpr = 1 - roc_obj$specificities,

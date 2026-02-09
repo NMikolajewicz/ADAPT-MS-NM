@@ -10,6 +10,25 @@ library(caret)
 library(pROC)
 library(VIM)
 
+.impute_with_reference <- function(reference_df, target_df, k = 5) {
+  if (nrow(target_df) == 0) {
+    return(target_df)
+  }
+
+  ref <- reference_df
+  tgt <- target_df
+  ref_ids <- paste0("ref__", seq_len(nrow(ref)))
+  tgt_ids <- paste0("target__", seq_len(nrow(tgt)))
+  rownames(ref) <- ref_ids
+  rownames(tgt) <- tgt_ids
+
+  combined <- rbind(ref, tgt)
+  combined_imp <- as.data.frame(kNN(combined, k = k, imp_var = FALSE))
+  tgt_imp <- combined_imp[tgt_ids, , drop = FALSE]
+  rownames(tgt_imp) <- rownames(target_df)
+  tgt_imp
+}
+
 BaselineClassifier <- setRefClass(
   "BaselineClassifier",
   fields = list(
@@ -73,11 +92,8 @@ BaselineClassifier <- setRefClass(
         X_train_imp <- as.data.frame(kNN(X_train, k = 5, imp_var = FALSE))
         rownames(X_train_imp) <- rownames(X_train)
 
-        # For test: combine with train for imputation context, then extract test rows
-        X_combined <- rbind(X_train, X_test)
-        X_combined_imp <- as.data.frame(kNN(X_combined, k = 5, imp_var = FALSE))
-        rownames(X_combined_imp) <- rownames(X_combined)
-        X_test_imp <- X_combined_imp[rownames(X_test), , drop = FALSE]
+        # For test: impute with train rows as context while preserving exact row alignment.
+        X_test_imp <- .impute_with_reference(X_train, X_test, k = 5)
 
         # Store imputer reference data for validation
         imputers[[length(imputers) + 1]] <<- X_train_imp
@@ -213,11 +229,9 @@ BaselineClassifier <- setRefClass(
         selected_feats <- selectors[[k]]
         imputer_ref <- imputers[[k]]
 
-        # Impute validation data using combined approach
-        X_combined <- rbind(imputer_ref[, colnames(X_val)], X_val)
-        X_combined_imp <- as.data.frame(kNN(X_combined, k = 5, imp_var = FALSE))
-        rownames(X_combined_imp) <- rownames(X_combined)
-        X_val_imp <- X_combined_imp[rownames(X_val), , drop = FALSE]
+        # Impute validation using training rows as context while avoiding row-name collisions.
+        X_val_imp <- .impute_with_reference(imputer_ref[, colnames(X_val), drop = FALSE],
+                                            X_val, k = 5)
 
         # Ensure selected features exist
         avail_feats <- intersect(selected_feats, colnames(X_val_imp))
