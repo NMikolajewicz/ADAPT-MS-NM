@@ -19,6 +19,8 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
 ```{r load_libraries}
 library(readxl)
 library(ggplot2)
+library(caret)
+library(VIM)
 
 # Source classifier modules
 source(file.path(here::here(), "R", "AdaptmsClassifier.R"))
