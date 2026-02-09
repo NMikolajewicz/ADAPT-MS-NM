@@ -1,0 +1,157 @@
+---
+title: "ADAPT-MS: Alzheimer's CSF Full Cohort Study"
+author: "ADAPT-MS Pipeline (R)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 6)
+```
+
+# 1. Load Dependencies and Classifiers
+
+```{r load_libraries}
+library(readxl)
+library(ggplot2)
+library(VIM)
+
+# Source classifier modules
+source(file.path(here::here(), "R", "AdaptmsClassifier.R"))
+source(file.path(here::here(), "R", "BaselineClassifier.R"))
+source(file.path(here::here(), "R", "NonValClassifier.R"))
+```
+
+# 2. Load Proteomics Data
+
+```{r load_proteomics}
+data_path <- file.path(here::here(), "data")
+
+# Load DIA-NN pg_matrix TSV
+df <- read.delim(file.path(data_path, "AD_CSF_full_study.pg_matrix.tsv"),
+                 sep = "\t", check.names = FALSE)
+
+cat("Protein groups:", nrow(df), "\n")
+cat("Total columns:", ncol(df), "\n")
+
+# Create gene dictionary
+gene_dict <- setNames(df$Genes, df$Protein.Group)
+
+# Extract protein intensity matrix (skip first 5 metadata columns)
+prot <- df[, -(1:5), drop = FALSE]
+rownames(prot) <- df$Protein.Group
+
+# Transpose: samples as rows, proteins as columns
+prot <- as.data.frame(t(prot))
+
+# Clean sample names (extract filename from path)
+rownames(prot) <- sapply(rownames(prot), function(x) {
+  parts <- strsplit(x, "/")[[1]]
+  fname <- parts[length(parts)]
+  sub("\\..*$", "", fname)
+})
+
+# Log10 transform, replacing 0 with NA
+prot[prot == 0] <- NA
+prot <- log10(prot)
+
+cat("Samples:", nrow(prot), "\n")
+cat("Proteins:", ncol(prot), "\n")
+```
+
+# 3. Load Sample Metadata
+
+```{r load_metadata}
+d_groups <- as.data.frame(
+  read_excel(file.path(data_path, "annotation of samples_AM1.5.11.xlsx"))
+)
+rownames(d_groups) <- d_groups$`sample name`
+
+cat <- d_groups[, "biochemical AD classification", drop = FALSE]
+
+cat("Metadata samples:", nrow(cat), "\n")
+cat("Classes:", paste(sort(unique(cat[[1]])), collapse = ", "), "\n")
+```
+
+# 4. PCA Visualization
+
+```{r pca}
+# Impute for PCA visualization
+prot_for_pca <- prot[rownames(prot) %in% rownames(d_groups), , drop = FALSE]
+prot_imputed <- as.data.frame(kNN(prot_for_pca, k = 5, imp_var = FALSE))
+rownames(prot_imputed) <- rownames(prot_for_pca)
+
+pca <- prcomp(prot_imputed, center = TRUE, scale. = TRUE)
+
+pca_df <- data.frame(
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  site = d_groups[rownames(prot_imputed), "collection site"]
+)
+
+var_explained <- summary(pca)$importance[2, 1:2] * 100
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = site)) +
+  geom_point(size = 2, alpha = 0.7) +
+  labs(
+    x = sprintf("PC1 (%.1f%%)", var_explained[1]),
+    y = sprintf("PC2 (%.1f%%)", var_explained[2]),
+    title = "PCA of AD CSF Full Cohort",
+    color = "Collection Site"
+  ) +
+  theme_minimal()
+```
+
+# 5. Baseline Classifier (Within-Cohort)
+
+```{r baseline}
+baseline <- BaselineClassifier$new(
+  prot_df = prot,
+  cat_df  = cat,
+  between = "biochemical AD classification"
+)
+
+baseline$classify_and_plot(
+  category1 = "biochemical control",
+  category2 = "biochemical AD",
+  n_runs = 10
+)
+```
+
+```{r save_baseline}
+baseline$save_plots_to_pdf(file.path(data_path, "AD_CSF_Baseline_R.pdf"))
+```
+
+# 6. NonVal Classifier (Repeated Splits, No External Validation)
+
+```{r nonval}
+nonval <- NonValClassifier$new(
+  prot_df = prot,
+  cat_df  = cat,
+  between = "biochemical AD classification"
+)
+
+result <- nonval$classify_and_plot_multiple(
+  category1 = "biochemical control",
+  category2 = "biochemical AD",
+  num_repeats = 10
+)
+
+cat(sprintf("Mean AUC: %.2f (95%% CI: %.2f - %.2f)\n",
+            result$mean_auc, result$ci[1], result$ci[2]))
+```
+
+```{r save_nonval}
+nonval$save_plots_to_pdf(file.path(data_path, "AD_CSF_NonVal_R.pdf"))
+```
+
+# 7. Session Info
+
+```{r session_info}
+sessionInfo()
+```

@@ -1,0 +1,206 @@
+---
+title: "ADAPT-MS: Sepsis Dataset Study"
+author: "ADAPT-MS Pipeline (R)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 6)
+```
+
+# 1. Load Dependencies and Classifiers
+
+```{r load_libraries}
+library(readxl)
+library(ggplot2)
+
+# Source classifier modules
+source(file.path(here::here(), "R", "AdaptmsClassifier.R"))
+source(file.path(here::here(), "R", "BaselineClassifier.R"))
+source(file.path(here::here(), "R", "XGBfillClassifier.R"))
+source(file.path(here::here(), "R", "AdaptmsMultiClassifier.R"))
+```
+
+# 2. Load Sepsis Proteomics Data
+
+```{r load_data}
+data_path <- file.path(here::here(), "data")
+
+# Load razor intensities
+df <- read.delim(file.path(data_path, "razor_intensities.tsv"),
+                 sep = "\t", check.names = FALSE)
+
+# Load sample metadata
+d_cat <- as.data.frame(read_excel(file.path(data_path, "sample_info_2575processed_PRIDE.xlsx")))
+
+cat("Protein groups:", nrow(df), "\n")
+cat("Total columns:", ncol(df), "\n")
+cat("Metadata samples:", nrow(d_cat), "\n")
+```
+
+# 3. Data Preprocessing
+
+```{r preprocess}
+# Extract protein columns (skip metadata columns)
+# The razor_intensities file has Protein.Group in first column
+gene_dict <- setNames(df$Genes, df$Protein.Group)
+
+prot <- df[, -(1:5), drop = FALSE]
+rownames(prot) <- df$Protein.Group
+prot <- as.data.frame(t(prot))
+
+# Clean sample names from Injection column format
+rownames(prot) <- sapply(rownames(prot), function(x) {
+  parts <- strsplit(x, "/")[[1]]
+  fname <- parts[length(parts)]
+  sub("\\..*$", "", fname)
+})
+
+# Log10 transform, zeros become NA
+prot[prot == 0] <- NA
+prot <- log10(prot)
+
+# Set up metadata with matching row names
+rownames(d_cat) <- as.character(d_cat$Injection)
+
+cat("Processed samples:", nrow(prot), "\n")
+cat("Processed proteins:", ncol(prot), "\n")
+```
+
+# 4. Define Discovery and Validation Cohorts
+
+```{r define_cohorts}
+# Discovery cohorts
+disc_groups <- c("GAinS_disc")
+disc_samples <- rownames(d_cat)[d_cat$Group %in% disc_groups]
+disc_samples <- intersect(disc_samples, rownames(prot))
+
+# Validation cohorts
+val_groups <- c("GAinS_vali")
+val_samples <- rownames(d_cat)[d_cat$Group %in% val_groups]
+val_samples <- intersect(val_samples, rownames(prot))
+
+prot_disc <- prot[disc_samples, , drop = FALSE]
+cat_disc  <- d_cat[disc_samples, "SRS", drop = FALSE]
+
+prot_val <- prot[val_samples, , drop = FALSE]
+cat_val  <- d_cat[val_samples, "SRS", drop = FALSE]
+
+cat("Discovery samples:", nrow(prot_disc), "\n")
+cat("Validation samples:", nrow(prot_val), "\n")
+```
+
+# 5. Baseline Classifier
+
+```{r baseline}
+baseline <- BaselineClassifier$new(
+  prot_df = prot_disc,
+  cat_df  = cat_disc,
+  between = "SRS"
+)
+
+baseline$classify_and_plot(
+  category1 = "SRS1",
+  category2 = "non-SRS1",
+  n_runs = 10
+)
+```
+
+## 5.1 Baseline Validation
+
+```{r baseline_val}
+baseline$validate_and_plot(
+  validation_prot_df = prot_val,
+  validation_cat_df  = cat_val,
+  category1 = "SRS1",
+  category2 = "non-SRS1"
+)
+```
+
+```{r save_baseline}
+baseline$save_plots_to_pdf(file.path(data_path, "Sepsis_Baseline_R.pdf"))
+```
+
+# 6. ADAPT-MS Classifier
+
+```{r adaptms}
+adaptms <- AdaptmsClassifierDF$new(
+  prot_df   = prot_disc,
+  cat_df    = cat_disc,
+  gene_dict = gene_dict,
+  between   = "SRS"
+)
+
+adaptms$classify_and_plot(
+  category1 = "SRS1",
+  category2 = "non-SRS1",
+  n_runs = 10,
+  topn_features = 50
+)
+```
+
+## 6.1 ADAPT-MS Validation
+
+```{r adaptms_val}
+adaptms$classify_dataframe(
+  validation_df     = prot_val,
+  validation_cat_df = cat_val
+)
+
+adaptms$plot_validation_roc(
+  category1 = "SRS1",
+  category2 = "non-SRS1"
+)
+```
+
+```{r save_adaptms}
+adaptms$save_plots_to_pdf(file.path(data_path, "Sepsis_ADAPTMS_R.pdf"))
+```
+
+# 7. XGBoost with Zero-Fill Validation
+
+```{r xgbfill}
+xgbfill <- XGBRFClassifierDF$new(
+  prot_df   = prot_disc,
+  cat_df    = cat_disc,
+  gene_dict = gene_dict,
+  between   = "SRS"
+)
+
+xgbfill$classify_and_plot(
+  category1 = "SRS1",
+  category2 = "non-SRS1",
+  n_runs = 10
+)
+```
+
+## 7.1 XGBfill Validation
+
+```{r xgbfill_val}
+xgbfill$classify_dataframe(
+  validation_df     = prot_val,
+  validation_cat_df = cat_val,
+  fill_na_strategy  = "zero"
+)
+
+xgbfill$plot_validation_roc(
+  category1 = "SRS1",
+  category2 = "non-SRS1"
+)
+```
+
+```{r save_xgbfill}
+xgbfill$save_plots_to_pdf(file.path(data_path, "Sepsis_XGBfill_R.pdf"))
+```
+
+# 8. Session Info
+
+```{r session_info}
+sessionInfo()
+```

@@ -1,0 +1,152 @@
+---
+title: "ADAPT-MS: Xue Published Dataset"
+author: "ADAPT-MS Pipeline (R)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 6)
+```
+
+# 1. Load Dependencies and Classifiers
+
+```{r load_libraries}
+library(readxl)
+library(ggplot2)
+
+# Source the classifier modules
+source(file.path(here::here(), "R", "AdaptmsClassifier.R"))
+source(file.path(here::here(), "R", "BaselineClassifier.R"))
+```
+
+# 2. Load the Xue Dataset
+
+The Xue dataset (Table S4) has two sheets: A (discovery) and B (validation).
+
+```{r load_data}
+data_path <- file.path(here::here(), "data")
+
+# Discovery set (Sheet A)
+df_disc <- as.data.frame(read_excel(file.path(data_path, "Xue_tableS4.xlsx"), sheet = "A"))
+rownames(df_disc) <- df_disc$Sample_ID
+df_disc$Sample_ID <- NULL
+
+# Validation set (Sheet B)
+df_val <- as.data.frame(read_excel(file.path(data_path, "Xue_tableS4.xlsx"), sheet = "B"))
+rownames(df_val) <- df_val$Sample_ID
+df_val$Sample_ID <- NULL
+
+cat("Discovery samples:", nrow(df_disc), "\n")
+cat("Validation samples:", nrow(df_val), "\n")
+```
+
+# 3. Separate Features and Labels
+
+```{r split_features_labels}
+# Last column is the label
+label_col <- colnames(df_disc)[ncol(df_disc)]
+
+# Discovery
+d_prot_disc <- df_disc[, -ncol(df_disc), drop = FALSE]
+d_cat_disc  <- df_disc[, label_col, drop = FALSE]
+
+# Validation
+d_prot_val <- df_val[, -ncol(df_val), drop = FALSE]
+d_cat_val  <- df_val[, label_col, drop = FALSE]
+
+cat("Number of features:", ncol(d_prot_disc), "\n")
+cat("Label column:", label_col, "\n")
+cat("Classes:", paste(unique(d_cat_disc[[label_col]]), collapse = ", "), "\n")
+```
+
+# 4. Baseline Classifier (RF + XGBoost)
+
+```{r baseline}
+baseline <- BaselineClassifier$new(
+  prot_df = d_prot_disc,
+  cat_df  = d_cat_disc,
+  between = label_col
+)
+
+baseline$classify_and_plot(
+  category1 = "0",
+  category2 = "1",
+  n_runs = 10
+)
+```
+
+## 4.1 Baseline Validation
+
+```{r baseline_validation}
+baseline$validate_and_plot(
+  validation_prot_df = d_prot_val,
+  validation_cat_df  = d_cat_val,
+  category1 = "0",
+  category2 = "1"
+)
+```
+
+## 4.2 Save Baseline Results
+
+```{r save_baseline}
+baseline$save_plots_to_pdf(file.path(data_path, "Xue_Baseline_R.pdf"))
+```
+
+# 5. ADAPT-MS Classifier
+
+```{r adaptms}
+adaptms <- AdaptmsClassifierDF$new(
+  prot_df = d_prot_disc,
+  cat_df  = d_cat_disc,
+  between = label_col
+)
+
+adaptms$classify_and_plot(
+  category1 = "0",
+  category2 = "1",
+  n_runs = 10,
+  topn_features = 50
+)
+```
+
+## 5.1 ADAPT-MS Validation (Per-Sample Refitting)
+
+```{r adaptms_validation}
+adaptms$classify_dataframe(
+  validation_df     = d_prot_val,
+  validation_cat_df = d_cat_val
+)
+
+adaptms$plot_validation_roc(
+  category1 = "0",
+  category2 = "1"
+)
+```
+
+## 5.2 Confusion Matrix
+
+```{r confusion_matrix}
+adaptms$plot_confusion_matrix(
+  category1 = "0",
+  category2 = "1",
+  normalize = TRUE
+)
+```
+
+## 5.3 Save ADAPT-MS Results
+
+```{r save_adaptms}
+adaptms$save_plots_to_pdf(file.path(data_path, "Xue_ADAPTMS_R.pdf"))
+```
+
+# 6. Session Info
+
+```{r session_info}
+sessionInfo()
+```

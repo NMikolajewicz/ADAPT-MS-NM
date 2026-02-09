@@ -1,0 +1,224 @@
+---
+title: "ADAPT-MS: AD CSF Cross-Cohort Validation (Sweden+Kiel -> Berlin)"
+author: "ADAPT-MS Pipeline (R)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 6)
+```
+
+# 1. Load Dependencies and Classifiers
+
+```{r load_libraries}
+library(readxl)
+library(ggplot2)
+
+# Source classifier modules
+source(file.path(here::here(), "R", "AdaptmsClassifier.R"))
+source(file.path(here::here(), "R", "BaselineClassifier.R"))
+source(file.path(here::here(), "R", "NonRefitClassifier.R"))
+```
+
+# 2. Load Data
+
+## Training data: Sweden + MagKiel
+
+```{r load_training}
+data_path <- file.path(here::here(), "data")
+
+# Training: Sweden + MagKiel combined
+df_train <- read.delim(
+  file.path(data_path, "AD_CSF_Sweden+MagKiel.pg_matrix.tsv"),
+  sep = "\t", check.names = FALSE
+)
+
+gene_dict <- setNames(df_train$Genes, df_train$Protein.Group)
+
+prot_train <- df_train[, -(1:5), drop = FALSE]
+rownames(prot_train) <- df_train$Protein.Group
+prot_train <- as.data.frame(t(prot_train))
+
+rownames(prot_train) <- sapply(rownames(prot_train), function(x) {
+  parts <- strsplit(x, "/")[[1]]
+  sub("\\..*$", "", parts[length(parts)])
+})
+
+prot_train[prot_train == 0] <- NA
+prot_train <- log10(prot_train)
+
+cat("Training samples:", nrow(prot_train), "\n")
+```
+
+## Validation data: Berlin
+
+```{r load_validation}
+df_val <- read.delim(
+  file.path(data_path, "AD_CSF_Berlin_Sw+MK_speclib.tsv"),
+  sep = "\t", check.names = FALSE
+)
+
+prot_val <- df_val[, -(1:5), drop = FALSE]
+rownames(prot_val) <- df_val$Protein.Group
+prot_val <- as.data.frame(t(prot_val))
+
+rownames(prot_val) <- sapply(rownames(prot_val), function(x) {
+  parts <- strsplit(x, "/")[[1]]
+  sub("\\..*$", "", parts[length(parts)])
+})
+
+prot_val[prot_val == 0] <- NA
+prot_val <- log10(prot_val)
+
+cat("Validation samples:", nrow(prot_val), "\n")
+```
+
+## Metadata
+
+```{r load_metadata}
+d_groups <- as.data.frame(
+  read_excel(file.path(data_path, "annotation of samples_AM1.5.11.xlsx"))
+)
+rownames(d_groups) <- d_groups$`sample name`
+
+cat_all <- d_groups[, "biochemical AD classification", drop = FALSE]
+
+cat_train <- cat_all[intersect(rownames(prot_train), rownames(cat_all)), , drop = FALSE]
+cat_val   <- cat_all[intersect(rownames(prot_val), rownames(cat_all)), , drop = FALSE]
+```
+
+## Find shared features
+
+```{r shared_features}
+shared_prots <- intersect(colnames(prot_train), colnames(prot_val))
+prot_train <- prot_train[, shared_prots, drop = FALSE]
+prot_val   <- prot_val[, shared_prots, drop = FALSE]
+
+cat("Shared proteins:", length(shared_prots), "\n")
+```
+
+# 3. Baseline Classifier
+
+```{r baseline}
+baseline <- BaselineClassifier$new(
+  prot_df = prot_train,
+  cat_df  = cat_train,
+  between = "biochemical AD classification"
+)
+
+baseline$classify_and_plot(
+  category1 = "biochemical control",
+  category2 = "biochemical AD",
+  n_runs = 10
+)
+```
+
+## Baseline Validation on Berlin
+
+```{r baseline_val}
+baseline$validate_and_plot(
+  validation_prot_df = prot_val,
+  validation_cat_df  = cat_val,
+  category1 = "biochemical control",
+  category2 = "biochemical AD"
+)
+```
+
+```{r save_baseline}
+baseline$save_plots_to_pdf(file.path(data_path, "AD_CSF_SwKiel_to_Berlin_Baseline_R.pdf"))
+```
+
+# 4. NonRefit Classifier (Ablation)
+
+```{r nonrefit}
+nonrefit <- NonRefitClassifier$new(
+  prot_df   = prot_train,
+  cat_df    = cat_train,
+  gene_dict = gene_dict,
+  between   = "biochemical AD classification"
+)
+
+nonrefit$classify_and_plot(
+  category1 = "biochemical control",
+  category2 = "biochemical AD",
+  n_runs = 10
+)
+```
+
+## NonRefit Validation on Berlin
+
+```{r nonrefit_val}
+nonrefit$validate_and_plot(
+  validation_prot_df = prot_val,
+  validation_cat_df  = cat_val,
+  category1 = "biochemical control",
+  category2 = "biochemical AD"
+)
+```
+
+```{r save_nonrefit}
+nonrefit$save_plots_to_pdf(file.path(data_path, "AD_CSF_SwKiel_to_Berlin_NonRefit_R.pdf"))
+```
+
+# 5. ADAPT-MS Folder-Based Validation
+
+This demonstrates the folder-based classifier that reads individual sample
+files from a directory, simulating the clinical workflow where samples arrive
+one at a time.
+
+```{r adaptms_folder}
+adaptms_folder <- AdaptmsClassifierFolder$new(
+  prot_df   = prot_train,
+  cat_df    = cat_train,
+  gene_dict = gene_dict,
+  between   = "biochemical AD classification"
+)
+
+adaptms_folder$classify_and_plot(
+  category1 = "biochemical control",
+  category2 = "biochemical AD",
+  n_runs = 10,
+  topn_features = 50
+)
+```
+
+## Classify samples from directory
+
+```{r adaptms_folder_classify}
+sf_dir <- file.path(data_path, "Single_file_results", "Train_sweden+MagKiel_apply_to_Berlin")
+
+if (dir.exists(sf_dir)) {
+  # Prepare metadata for single-file samples
+  cat_sf <- cat_all
+
+  adaptms_folder$classify_directory(
+    directory = sf_dir,
+    cat_validation_pool_SF = cat_sf,
+    category1 = "biochemical control",
+    category2 = "biochemical AD"
+  )
+
+  adaptms_folder$plot_accumulated_roc(
+    category1 = "biochemical control",
+    category2 = "biochemical AD"
+  )
+
+  adaptms_folder$save_plots_to_pdf(
+    file.path(data_path, "AD_CSF_SwKiel_to_Berlin_ADAPTMS_Folder_R.pdf")
+  )
+} else {
+  cat("Single-file results directory not found. Skipping folder-based validation.\n")
+}
+```
+
+# 6. Session Info
+
+```{r session_info}
+sessionInfo()
+```
