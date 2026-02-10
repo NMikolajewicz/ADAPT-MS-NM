@@ -120,6 +120,16 @@ BaselineClassifier <- setRefClass(
         y_train <- y_filtered[train_idx]
         y_test  <- y_filtered[-train_idx]
 
+        # VIM::kNN errors when columns are entirely NA.
+        # Drop such columns for this run and align test columns accordingly.
+        non_all_na <- colSums(!is.na(X_train)) > 0
+        if (!any(non_all_na)) {
+          warning(sprintf("Run %d skipped: all training features are completely NA.", i))
+          next
+        }
+        X_train <- X_train[, non_all_na, drop = FALSE]
+        X_test  <- X_test[, colnames(X_train), drop = FALSE]
+
         # KNN impute train and test
         X_train_imp <- as.data.frame(kNN(X_train, k = 5, imp_var = FALSE))
         rownames(X_train_imp) <- rownames(X_train)
@@ -262,15 +272,25 @@ BaselineClassifier <- setRefClass(
         selected_feats <- selectors[[k]]
         imputer_ref <- imputers[[k]]
 
-        # Impute validation using training rows as context while avoiding row-name collisions.
-        X_val_imp <- .impute_with_reference(imputer_ref[, colnames(X_val), drop = FALSE],
-                                            X_val, k = 5)
+        # Keep selected features in training order; add missing validation columns as NA.
+        selected_feats <- unique(selected_feats)
+        if (length(selected_feats) == 0) next
+        missing_val_cols <- setdiff(selected_feats, colnames(X_val))
+        for (mc in missing_val_cols) X_val[[mc]] <- NA
 
-        # Ensure selected features exist
-        avail_feats <- intersect(selected_feats, colnames(X_val_imp))
-        if (length(avail_feats) < 2) next
+        # Impute only model-selected features to avoid broad alignment issues.
+        ref_feats <- intersect(selected_feats, colnames(imputer_ref))
+        if (length(ref_feats) == 0) next
+        X_val_imp <- .impute_with_reference(
+          imputer_ref[, ref_feats, drop = FALSE],
+          X_val[, ref_feats, drop = FALSE],
+          k = 5
+        )
 
-        X_val_sel <- X_val_imp[, avail_feats, drop = FALSE]
+        # Require exactly the trained feature set for this model.
+        if (!all(selected_feats %in% colnames(X_val_imp))) next
+
+        X_val_sel <- X_val_imp[, selected_feats, drop = FALSE]
 
         dval <- xgb.DMatrix(data = as.matrix(X_val_sel))
         y_pred_prob <- predict(xgb_model, dval)
