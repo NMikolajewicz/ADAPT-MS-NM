@@ -23,6 +23,18 @@ library(VIM)
   interp_tpr
 }
 
+.get_env_int_nonval <- function(var_name, default_value, min_value = 1L) {
+  raw <- Sys.getenv(var_name, unset = "")
+  if (!nzchar(raw)) {
+    return(as.integer(default_value))
+  }
+  parsed <- suppressWarnings(as.integer(raw))
+  if (is.na(parsed) || parsed < min_value) {
+    return(as.integer(default_value))
+  }
+  parsed
+}
+
 NonValClassifier <- setRefClass(
   "NonValClassifier",
   fields = list(
@@ -45,6 +57,9 @@ NonValClassifier <- setRefClass(
       if (between == "") {
         stop("The 'between' parameter must be set to specify the categories for classification.")
       }
+
+      rf_trees <- .get_env_int_nonval("ADAPTMS_RF_TREES", 100L, min_value = 1L)
+      xgb_nrounds <- .get_env_int_nonval("ADAPTMS_XGB_NROUNDS", 100L, min_value = 1L)
 
       # KNN impute protein data
       prot_imp <- as.data.frame(kNN(.self$prot_df, k = 5, imp_var = FALSE))
@@ -98,7 +113,7 @@ NonValClassifier <- setRefClass(
         # Feature selection with Random Forest
         rf_model <- randomForest(
           x = X_train, y = factor(y_train),
-          ntree = 100, importance = TRUE
+          ntree = rf_trees, importance = TRUE
         )
         importance_vals <- importance(rf_model, type = 1)[, 1]
         selected_feats <- names(importance_vals[importance_vals > mean(importance_vals)])
@@ -119,7 +134,7 @@ NonValClassifier <- setRefClass(
           max_depth = 6,
           eta = 0.1
         )
-        model <- xgb.train(params = params, data = dtrain, nrounds = 100, verbose = 0)
+        model <- xgb.train(params = params, data = dtrain, nrounds = xgb_nrounds, verbose = 0)
 
         y_test_pred <- predict(model, dtest)
 

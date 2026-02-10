@@ -41,6 +41,18 @@ library(VIM)
   make.unique(ids)
 }
 
+.get_env_int_xgb <- function(var_name, default_value, min_value = 1L) {
+  raw <- Sys.getenv(var_name, unset = "")
+  if (!nzchar(raw)) {
+    return(as.integer(default_value))
+  }
+  parsed <- suppressWarnings(as.integer(raw))
+  if (is.na(parsed) || parsed < min_value) {
+    return(as.integer(default_value))
+  }
+  parsed
+}
+
 # -----------------------------------------------------------------------------
 # XGBRFClassifierDF
 # DataFrame-based variant
@@ -88,6 +100,10 @@ XGBRFClassifierDF <- setRefClass(
       if (between == "") {
         stop("No between variable given. Please provide a variable for classification.")
       }
+
+      n_estimators_rf <- .get_env_int_xgb("ADAPTMS_RF_TREES", n_estimators_rf, min_value = 1L)
+      xgb_nrounds <- .get_env_int_xgb("ADAPTMS_XGB_NROUNDS", 100L, min_value = 1L)
+      cv_folds <- .get_env_int_xgb("ADAPTMS_CV_FOLDS", 5L, min_value = 2L)
 
       # Drop all-NA columns
       all_na_cols <- sapply(.self$prot_df, function(x) all(is.na(x)))
@@ -168,11 +184,12 @@ XGBRFClassifierDF <- setRefClass(
           eta = 0.1
         )
 
-        xgb_model <- xgb.train(params = params, data = dtrain, nrounds = 100, verbose = 0)
+        xgb_model <- xgb.train(params = params, data = dtrain, nrounds = xgb_nrounds, verbose = 0)
         models[[length(models) + 1]] <<- xgb_model
 
         # 5-fold CV
-        folds <- createFolds(y_train, k = 5, list = TRUE, returnTrain = TRUE)
+        k_folds <- max(2L, min(cv_folds, length(y_train)))
+        folds <- createFolds(y_train, k = k_folds, list = TRUE, returnTrain = TRUE)
         cv_tprs <- matrix(nrow = 0, ncol = 100)
 
         for (fold_train_idx in folds) {
@@ -182,7 +199,7 @@ XGBRFClassifierDF <- setRefClass(
           dcv_val <- xgb.DMatrix(data = X_train_sel[fold_val_idx, , drop = FALSE])
           y_cv_val <- y_train[fold_val_idx]
 
-          cv_model <- xgb.train(params = params, data = dcv_train, nrounds = 100, verbose = 0)
+          cv_model <- xgb.train(params = params, data = dcv_train, nrounds = xgb_nrounds, verbose = 0)
           probas <- predict(cv_model, dcv_val)
 
           if (length(unique(y_cv_val)) > 1) {
@@ -228,7 +245,7 @@ XGBRFClassifierDF <- setRefClass(
       # Train final XGBoost on raw data with selected features
       X_final <- as.matrix(.self$training_data[, selected_features, drop = FALSE])
       dfinal <- xgb.DMatrix(data = X_final, label = y_filtered)
-      final_model <<- xgb.train(params = params, data = dfinal, nrounds = 100, verbose = 0)
+      final_model <<- xgb.train(params = params, data = dfinal, nrounds = xgb_nrounds, verbose = 0)
 
       # Plot
       if (nrow(all_tprs) > 0) {
@@ -404,6 +421,10 @@ XGBRFClassifierFolder <- setRefClass(
         stop("No between variable given.")
       }
 
+      n_estimators_rf <- .get_env_int_xgb("ADAPTMS_RF_TREES", n_estimators_rf, min_value = 1L)
+      xgb_nrounds <- .get_env_int_xgb("ADAPTMS_XGB_NROUNDS", 100L, min_value = 1L)
+      cv_folds <- .get_env_int_xgb("ADAPTMS_CV_FOLDS", 5L, min_value = 2L)
+
       shared_ids <- intersect(rownames(.self$prot_df), rownames(.self$cat_df))
       d_ML <- cbind(.self$prot_df[shared_ids, , drop = FALSE],
                     .self$cat_df[shared_ids, between, drop = FALSE])
@@ -475,11 +496,12 @@ XGBRFClassifierFolder <- setRefClass(
         X_test_sel  <- as.matrix(X_test_raw[, sel_feats, drop = FALSE])
 
         dtrain <- xgb.DMatrix(data = X_train_sel, label = y_train)
-        xgb_model <- xgb.train(params = params, data = dtrain, nrounds = 100, verbose = 0)
+        xgb_model <- xgb.train(params = params, data = dtrain, nrounds = xgb_nrounds, verbose = 0)
         models[[length(models) + 1]] <<- xgb_model
 
         # 5-fold CV
-        folds <- createFolds(y_train, k = 5, list = TRUE, returnTrain = TRUE)
+        k_folds <- max(2L, min(cv_folds, length(y_train)))
+        folds <- createFolds(y_train, k = k_folds, list = TRUE, returnTrain = TRUE)
         cv_tprs <- matrix(nrow = 0, ncol = 100)
 
         for (fold_train_idx in folds) {
@@ -489,7 +511,7 @@ XGBRFClassifierFolder <- setRefClass(
           dcv_val <- xgb.DMatrix(data = X_train_sel[fold_val_idx, , drop = FALSE])
           y_cv_val <- y_train[fold_val_idx]
 
-          cv_model <- xgb.train(params = params, data = dcv_train, nrounds = 100, verbose = 0)
+          cv_model <- xgb.train(params = params, data = dcv_train, nrounds = xgb_nrounds, verbose = 0)
           probas <- predict(cv_model, dcv_val)
 
           if (length(unique(y_cv_val)) > 1) {
@@ -533,7 +555,7 @@ XGBRFClassifierFolder <- setRefClass(
 
       X_final <- as.matrix(.self$training_data[, selected_features, drop = FALSE])
       dfinal <- xgb.DMatrix(data = X_final, label = y_filtered)
-      final_model <<- xgb.train(params = params, data = dfinal, nrounds = 100, verbose = 0)
+      final_model <<- xgb.train(params = params, data = dfinal, nrounds = xgb_nrounds, verbose = 0)
 
       if (nrow(all_tprs) > 0) {
         median_tpr <- apply(all_tprs, 2, median)

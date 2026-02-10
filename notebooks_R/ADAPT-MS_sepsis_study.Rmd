@@ -36,6 +36,8 @@ sanitize_row_ids <- function(x, prefix = "row") {
   }
   make.unique(ids)
 }
+
+model_runs <- as.integer(Sys.getenv("ADAPTMS_N_RUNS", "10"))
 ```
 
 # 2. Load Sepsis Proteomics Data
@@ -59,27 +61,39 @@ cat("Metadata samples:", nrow(d_cat), "\n")
 
 ```{r preprocess}
 # Extract protein columns (skip metadata columns)
-# The razor_intensities file has Protein.Group in first column
-gene_dict <- setNames(df$Genes, df$Protein.Group)
+# The raw file uses "Protein Group"/"Gene Names" and "<Injection> Razor Intensity" columns.
+protein_group_col <- if ("Protein.Group" %in% colnames(df)) "Protein.Group" else "Protein Group"
+gene_names_col <- if ("Genes" %in% colnames(df)) "Genes" else "Gene Names"
+intensity_cols <- grep("Razor Intensity$", colnames(df), value = TRUE)
 
-prot <- df[, -(1:5), drop = FALSE]
-rownames(prot) <- sanitize_row_ids(df$Protein.Group, prefix = "protein_group")
+if (!protein_group_col %in% colnames(df) || !gene_names_col %in% colnames(df)) {
+  stop("Expected protein group and gene name columns were not found in razor_intensities.tsv.")
+}
+if (length(intensity_cols) == 0) {
+  stop("No '*Razor Intensity' columns found in razor_intensities.tsv.")
+}
+
+gene_dict <- setNames(df[[gene_names_col]], df[[protein_group_col]])
+
+prot <- df[, intensity_cols, drop = FALSE]
+rownames(prot) <- sanitize_row_ids(df[[protein_group_col]], prefix = "protein_group")
 prot <- as.data.frame(t(prot))
 
-# Clean sample names from Injection column format
-rownames(prot) <- sapply(rownames(prot), function(x) {
-  parts <- strsplit(x, "/")[[1]]
-  fname <- parts[length(parts)]
-  sub("\\..*$", "", fname)
-})
-rownames(prot) <- sanitize_row_ids(rownames(prot), prefix = "sample")
+# Clean sample names from "<Injection> Razor Intensity"
+rownames(prot) <- sanitize_row_ids(
+  sub(" Razor Intensity$", "", rownames(prot)),
+  prefix = "sample"
+)
+
+# Ensure numeric columns before transformation
+prot[] <- lapply(prot, function(col) suppressWarnings(as.numeric(col)))
 
 # Log10 transform, zeros become NA
 prot[prot == 0] <- NA
 prot <- log10(prot)
 
 # Set up metadata with matching row names
-rownames(d_cat) <- sanitize_row_ids(d_cat$Injection, prefix = "injection")
+rownames(d_cat) <- sanitize_row_ids(as.character(d_cat$Injection), prefix = "injection")
 
 cat("Processed samples:", nrow(prot), "\n")
 cat("Processed proteins:", ncol(prot), "\n")
@@ -120,7 +134,7 @@ baseline <- BaselineClassifier$new(
 baseline$classify_and_plot(
   category1 = "SRS1",
   category2 = "non-SRS1",
-  n_runs = 10
+  n_runs = model_runs
 )
 ```
 
@@ -152,7 +166,7 @@ adaptms <- AdaptmsClassifierDF$new(
 adaptms$classify_and_plot(
   category1 = "SRS1",
   category2 = "non-SRS1",
-  n_runs = 10,
+  n_runs = model_runs,
   topn_features = 50
 )
 ```
@@ -188,7 +202,7 @@ xgbfill <- XGBRFClassifierDF$new(
 xgbfill$classify_and_plot(
   category1 = "SRS1",
   category2 = "non-SRS1",
-  n_runs = 10
+  n_runs = model_runs
 )
 ```
 

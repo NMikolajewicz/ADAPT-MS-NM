@@ -33,6 +33,17 @@ sanitize_row_ids <- function(x, prefix = "row") {
   }
   make.unique(ids)
 }
+
+normalize_sample_ids <- function(x) {
+  ids <- trimws(as.character(x))
+  ids <- basename(ids)
+  ids <- sub("\\.raw\\.PG\\.Quantity$", "", ids, ignore.case = TRUE)
+  ids <- sub("\\.raw$", "", ids, ignore.case = TRUE)
+  ids <- sub("\\.[^.]+$", "", ids)
+  ids
+}
+
+model_runs <- as.integer(Sys.getenv("ADAPTMS_N_RUNS", "10"))
 ```
 
 # 2. Load Data
@@ -54,11 +65,10 @@ prot_train <- df_train[, -(1:5), drop = FALSE]
 rownames(prot_train) <- sanitize_row_ids(df_train$Protein.Group, prefix = "protein_group")
 prot_train <- as.data.frame(t(prot_train))
 
-rownames(prot_train) <- sapply(rownames(prot_train), function(x) {
-  parts <- strsplit(x, "/")[[1]]
-  sub("\\..*$", "", parts[length(parts)])
-})
-rownames(prot_train) <- sanitize_row_ids(rownames(prot_train), prefix = "sample")
+rownames(prot_train) <- sanitize_row_ids(
+  normalize_sample_ids(rownames(prot_train)),
+  prefix = "sample"
+)
 
 prot_train[prot_train == 0] <- NA
 prot_train <- log10(prot_train)
@@ -78,11 +88,10 @@ prot_val <- df_val[, -(1:5), drop = FALSE]
 rownames(prot_val) <- sanitize_row_ids(df_val$Protein.Group, prefix = "protein_group")
 prot_val <- as.data.frame(t(prot_val))
 
-rownames(prot_val) <- sapply(rownames(prot_val), function(x) {
-  parts <- strsplit(x, "/")[[1]]
-  sub("\\..*$", "", parts[length(parts)])
-})
-rownames(prot_val) <- sanitize_row_ids(rownames(prot_val), prefix = "sample")
+rownames(prot_val) <- sanitize_row_ids(
+  normalize_sample_ids(rownames(prot_val)),
+  prefix = "sample"
+)
 
 prot_val[prot_val == 0] <- NA
 prot_val <- log10(prot_val)
@@ -96,12 +105,18 @@ cat("Validation samples:", nrow(prot_val), "\n")
 d_groups <- as.data.frame(
   read_excel(file.path(data_path, "annotation of samples_AM1.5.11.xlsx"))
 )
-rownames(d_groups) <- sanitize_row_ids(d_groups$`sample name`, prefix = "sample_name")
+rownames(d_groups) <- sanitize_row_ids(
+  normalize_sample_ids(d_groups$`sample name`),
+  prefix = "sample_name"
+)
 
 cat_all <- d_groups[, "biochemical AD classification", drop = FALSE]
 
 cat_train <- cat_all[intersect(rownames(prot_train), rownames(cat_all)), , drop = FALSE]
 cat_val   <- cat_all[intersect(rownames(prot_val), rownames(cat_all)), , drop = FALSE]
+
+cat("Training metadata-matched samples:", nrow(cat_train), "\n")
+cat("Validation metadata-matched samples:", nrow(cat_val), "\n")
 ```
 
 ## Find shared features
@@ -126,7 +141,7 @@ baseline <- BaselineClassifier$new(
 baseline$classify_and_plot(
   category1 = "biochemical control",
   category2 = "biochemical AD",
-  n_runs = 10
+  n_runs = model_runs
 )
 ```
 
@@ -158,7 +173,7 @@ nonrefit <- NonRefitClassifier$new(
 nonrefit$classify_and_plot(
   category1 = "biochemical control",
   category2 = "biochemical AD",
-  n_runs = 10
+  n_runs = model_runs
 )
 ```
 
@@ -194,7 +209,7 @@ adaptms_folder <- AdaptmsClassifierFolder$new(
 adaptms_folder$classify_and_plot(
   category1 = "biochemical control",
   category2 = "biochemical AD",
-  n_runs = 10,
+  n_runs = model_runs,
   topn_features = 50
 )
 ```

@@ -32,6 +32,22 @@ sanitize_row_ids <- function(x, prefix = "row") {
   }
   make.unique(ids)
 }
+
+coerce_numeric_df <- function(df) {
+  out <- lapply(df, function(col) {
+    if (is.numeric(col)) {
+      return(col)
+    }
+    col_chr <- trimws(as.character(col))
+    col_chr[col_chr %in% c("", "NA", "NaN", "NULL", "null")] <- NA
+    suppressWarnings(as.numeric(col_chr))
+  })
+  out <- as.data.frame(out, check.names = FALSE)
+  rownames(out) <- rownames(df)
+  out
+}
+
+model_runs <- as.integer(Sys.getenv("ADAPTMS_N_RUNS", "10"))
 ```
 
 # 2. Load the Xue Dataset
@@ -69,6 +85,14 @@ d_cat_disc  <- df_disc[, label_col, drop = FALSE]
 d_prot_val <- df_val[, -ncol(df_val), drop = FALSE]
 d_cat_val  <- df_val[, label_col, drop = FALSE]
 
+# Ensure feature blocks are numeric with proper NA handling
+d_prot_disc <- coerce_numeric_df(d_prot_disc)
+d_prot_val  <- coerce_numeric_df(d_prot_val)
+
+# Force labels to character so category matching is stable
+d_cat_disc[[label_col]] <- as.character(d_cat_disc[[label_col]])
+d_cat_val[[label_col]]  <- as.character(d_cat_val[[label_col]])
+
 cat("Number of features:", ncol(d_prot_disc), "\n")
 cat("Label column:", label_col, "\n")
 cat("Classes:", paste(unique(d_cat_disc[[label_col]]), collapse = ", "), "\n")
@@ -86,7 +110,7 @@ baseline <- BaselineClassifier$new(
 baseline$classify_and_plot(
   category1 = "0",
   category2 = "1",
-  n_runs = 10
+  n_runs = model_runs
 )
 ```
 
@@ -119,7 +143,7 @@ adaptms <- AdaptmsClassifierDF$new(
 adaptms$classify_and_plot(
   category1 = "0",
   category2 = "1",
-  n_runs = 10,
+  n_runs = model_runs,
   topn_features = 50
 )
 ```

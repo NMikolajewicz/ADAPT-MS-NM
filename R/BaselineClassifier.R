@@ -29,6 +29,18 @@ library(VIM)
   tgt_imp
 }
 
+.get_env_int_baseline <- function(var_name, default_value, min_value = 1L) {
+  raw <- Sys.getenv(var_name, unset = "")
+  if (!nzchar(raw)) {
+    return(as.integer(default_value))
+  }
+  parsed <- suppressWarnings(as.integer(raw))
+  if (is.na(parsed) || parsed < min_value) {
+    return(as.integer(default_value))
+  }
+  parsed
+}
+
 BaselineClassifier <- setRefClass(
   "BaselineClassifier",
   fields = list(
@@ -59,6 +71,10 @@ BaselineClassifier <- setRefClass(
       if (between == "") {
         stop("The 'between' attribute must be set to a valid column name.")
       }
+
+      rf_trees <- .get_env_int_baseline("ADAPTMS_RF_TREES", n_estimators, min_value = 1L)
+      xgb_nrounds <- .get_env_int_baseline("ADAPTMS_XGB_NROUNDS", 100L, min_value = 1L)
+      cv_folds <- .get_env_int_baseline("ADAPTMS_CV_FOLDS", 5L, min_value = 2L)
 
       # Merge on row names
       shared_ids <- intersect(rownames(.self$prot_df), rownames(.self$cat_df))
@@ -117,7 +133,7 @@ BaselineClassifier <- setRefClass(
         # Feature selection using Random Forest
         rf_model <- randomForest(
           x = as.matrix(X_train_imp), y = factor(y_train),
-          ntree = n_estimators, importance = TRUE
+          ntree = rf_trees, importance = TRUE
         )
         importance_vals <- importance(rf_model, type = 1)[, 1]  # Mean decrease accuracy
         # Select features above mean importance (mimics SelectFromModel)
@@ -140,12 +156,13 @@ BaselineClassifier <- setRefClass(
           max_depth = 6,
           eta = 0.1
         )
-        xgb_model <- xgb.train(params = params, data = dtrain, nrounds = 100,
+        xgb_model <- xgb.train(params = params, data = dtrain, nrounds = xgb_nrounds,
                                 verbose = 0)
         models[[length(models) + 1]] <<- xgb_model
 
         # 5-fold CV for ROC
-        folds <- createFolds(y_train, k = 5, list = TRUE, returnTrain = TRUE)
+        k_folds <- max(2L, min(cv_folds, length(y_train)))
+        folds <- createFolds(y_train, k = k_folds, list = TRUE, returnTrain = TRUE)
         cv_tprs <- matrix(nrow = 0, ncol = 100)
 
         for (fold_train_idx in folds) {
@@ -156,7 +173,7 @@ BaselineClassifier <- setRefClass(
           dcv_val <- xgb.DMatrix(data = as.matrix(X_train_sel[fold_val_idx, , drop = FALSE]))
           y_cv_val <- y_train[fold_val_idx]
 
-          cv_model <- xgb.train(params = params, data = dcv_train, nrounds = 100,
+          cv_model <- xgb.train(params = params, data = dcv_train, nrounds = xgb_nrounds,
                                  verbose = 0)
           probas <- predict(cv_model, dcv_val)
 

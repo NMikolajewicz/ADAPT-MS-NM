@@ -34,6 +34,17 @@ sanitize_row_ids <- function(x, prefix = "row") {
   }
   make.unique(ids)
 }
+
+normalize_sample_ids <- function(x) {
+  ids <- trimws(as.character(x))
+  ids <- basename(ids)
+  ids <- sub("\\.raw\\.PG\\.Quantity$", "", ids, ignore.case = TRUE)
+  ids <- sub("\\.raw$", "", ids, ignore.case = TRUE)
+  ids <- sub("\\.[^.]+$", "", ids)
+  ids
+}
+
+model_runs <- as.integer(Sys.getenv("ADAPTMS_N_RUNS", "10"))
 ```
 
 # 2. Load Proteomics Data
@@ -58,13 +69,11 @@ rownames(prot) <- sanitize_row_ids(df$Protein.Group, prefix = "protein_group")
 # Transpose: samples as rows, proteins as columns
 prot <- as.data.frame(t(prot))
 
-# Clean sample names (extract filename from path)
-rownames(prot) <- sapply(rownames(prot), function(x) {
-  parts <- strsplit(x, "/")[[1]]
-  fname <- parts[length(parts)]
-  sub("\\..*$", "", fname)
-})
-rownames(prot) <- sanitize_row_ids(rownames(prot), prefix = "sample")
+# Clean sample names
+rownames(prot) <- sanitize_row_ids(
+  normalize_sample_ids(rownames(prot)),
+  prefix = "sample"
+)
 
 # Log10 transform, replacing 0 with NA
 prot[prot == 0] <- NA
@@ -80,7 +89,10 @@ cat("Proteins:", ncol(prot), "\n")
 d_groups <- as.data.frame(
   read_excel(file.path(data_path, "annotation of samples_AM1.5.11.xlsx"))
 )
-rownames(d_groups) <- sanitize_row_ids(d_groups$`sample name`, prefix = "sample_name")
+rownames(d_groups) <- sanitize_row_ids(
+  normalize_sample_ids(d_groups$`sample name`),
+  prefix = "sample_name"
+)
 
 cat <- d_groups[, "biochemical AD classification", drop = FALSE]
 
@@ -93,10 +105,31 @@ cat("Classes:", paste(sort(unique(cat[[1]])), collapse = ", "), "\n")
 ```{r pca}
 # Impute for PCA visualization
 prot_for_pca <- prot[rownames(prot) %in% rownames(d_groups), , drop = FALSE]
+all_na_cols <- vapply(prot_for_pca, function(x) all(is.na(x)), logical(1))
+prot_for_pca <- prot_for_pca[, !all_na_cols, drop = FALSE]
+
+if (nrow(prot_for_pca) < 2 || ncol(prot_for_pca) < 2) {
+  stop("Not enough matched, non-empty data for PCA after metadata alignment.")
+}
+
 prot_imputed <- as.data.frame(kNN(prot_for_pca, k = 5, imp_var = FALSE))
 rownames(prot_imputed) <- rownames(prot_for_pca)
 
-pca <- prcomp(prot_imputed, center = TRUE, scale. = TRUE)
+non_constant_cols <- vapply(
+  prot_imputed,
+  function(x) {
+    x <- x[is.finite(x)]
+    length(x) > 1 && sd(x) > 0
+  },
+  logical(1)
+)
+prot_for_pca_model <- prot_imputed[, non_constant_cols, drop = FALSE]
+
+if (ncol(prot_for_pca_model) < 2) {
+  stop("Not enough variable protein features remain for PCA.")
+}
+
+pca <- prcomp(prot_for_pca_model, center = TRUE, scale. = TRUE)
 
 pca_df <- data.frame(
   PC1 = pca$x[, 1],
@@ -129,7 +162,7 @@ baseline <- BaselineClassifier$new(
 baseline$classify_and_plot(
   category1 = "biochemical control",
   category2 = "biochemical AD",
-  n_runs = 10
+  n_runs = model_runs
 )
 ```
 
@@ -149,7 +182,7 @@ nonval <- NonValClassifier$new(
 result <- nonval$classify_and_plot_multiple(
   category1 = "biochemical control",
   category2 = "biochemical AD",
-  num_repeats = 10
+  num_repeats = model_runs
 )
 
 cat(sprintf("Mean AUC: %.2f (95%% CI: %.2f - %.2f)\n",
