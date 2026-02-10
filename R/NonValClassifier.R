@@ -10,6 +10,15 @@ library(caret)
 library(pROC)
 library(VIM)
 
+if (!exists(".adaptms_impute_dataset", mode = "function")) {
+  util_candidates <- c(file.path("R", "ImputationUtils.R"), "ImputationUtils.R")
+  util_path <- util_candidates[file.exists(util_candidates)][1]
+  if (is.na(util_path)) {
+    stop("Missing required utility file: R/ImputationUtils.R")
+  }
+  source(util_path)
+}
+
 .interp_tpr_on_grid <- function(fpr, tpr, mean_fpr) {
   ord <- order(fpr, tpr)
   fpr_sorted <- fpr[ord]
@@ -61,9 +70,8 @@ NonValClassifier <- setRefClass(
       rf_trees <- .get_env_int_nonval("ADAPTMS_RF_TREES", 100L, min_value = 1L)
       xgb_nrounds <- .get_env_int_nonval("ADAPTMS_XGB_NROUNDS", 100L, min_value = 1L)
 
-      # KNN impute protein data
-      prot_imp <- as.data.frame(kNN(.self$prot_df, k = 5, imp_var = FALSE))
-      rownames(prot_imp) <- rownames(.self$prot_df)
+      # Fast KNN-style imputation (configurable via ADAPTMS_IMPUTE_METHOD).
+      prot_imp <- .adaptms_impute_dataset(.self$prot_df, k = 5)
 
       # Merge
       shared_ids <- intersect(rownames(prot_imp), rownames(.self$cat_df))

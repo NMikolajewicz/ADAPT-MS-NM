@@ -10,23 +10,21 @@ library(caret)
 library(pROC)
 library(VIM)
 
+if (!exists(".adaptms_impute_dataset", mode = "function")) {
+  util_candidates <- c(file.path("R", "ImputationUtils.R"), "ImputationUtils.R")
+  util_path <- util_candidates[file.exists(util_candidates)][1]
+  if (is.na(util_path)) {
+    stop("Missing required utility file: R/ImputationUtils.R")
+  }
+  source(util_path)
+}
+
 .impute_with_reference <- function(reference_df, target_df, k = 5) {
   if (nrow(target_df) == 0) {
     return(target_df)
   }
-
-  ref <- reference_df
-  tgt <- target_df
-  ref_ids <- paste0("ref__", seq_len(nrow(ref)))
-  tgt_ids <- paste0("target__", seq_len(nrow(tgt)))
-  rownames(ref) <- ref_ids
-  rownames(tgt) <- tgt_ids
-
-  combined <- rbind(ref, tgt)
-  combined_imp <- as.data.frame(kNN(combined, k = k, imp_var = FALSE))
-  tgt_imp <- combined_imp[tgt_ids, , drop = FALSE]
-  rownames(tgt_imp) <- rownames(target_df)
-  tgt_imp
+  imputer <- .adaptms_prepare_imputer(reference_df, k = k)
+  .adaptms_impute_with_imputer(imputer, target_df, exclude_self = FALSE)
 }
 
 .get_env_int_baseline <- function(var_name, default_value, min_value = 1L) {
@@ -130,15 +128,13 @@ BaselineClassifier <- setRefClass(
         X_train <- X_train[, non_all_na, drop = FALSE]
         X_test  <- X_test[, colnames(X_train), drop = FALSE]
 
-        # KNN impute train and test
-        X_train_imp <- as.data.frame(kNN(X_train, k = 5, imp_var = FALSE))
-        rownames(X_train_imp) <- rownames(X_train)
+        # Fast imputation using reusable neighbor state for train/test.
+        run_imputer <- .adaptms_prepare_imputer(X_train, k = 5)
+        X_train_imp <- .adaptms_impute_with_imputer(run_imputer, X_train, exclude_self = TRUE)
+        X_test_imp  <- .adaptms_impute_with_imputer(run_imputer, X_test, exclude_self = FALSE)
 
-        # For test: impute with train rows as context while preserving exact row alignment.
-        X_test_imp <- .impute_with_reference(X_train, X_test, k = 5)
-
-        # Store imputer reference data for validation
-        imputers[[length(imputers) + 1]] <<- X_train_imp
+        # Store imputer object for validation
+        imputers[[length(imputers) + 1]] <<- run_imputer
 
         # Feature selection using Random Forest
         rf_model <- randomForest(
@@ -279,12 +275,13 @@ BaselineClassifier <- setRefClass(
         for (mc in missing_val_cols) X_val[[mc]] <- NA
 
         # Impute only model-selected features to avoid broad alignment issues.
-        ref_feats <- intersect(selected_feats, colnames(imputer_ref))
+        imputer_cols <- .adaptms_imputer_columns(imputer_ref)
+        ref_feats <- intersect(selected_feats, imputer_cols)
         if (length(ref_feats) == 0) next
-        X_val_imp <- .impute_with_reference(
-          imputer_ref[, ref_feats, drop = FALSE],
+        X_val_imp <- .adaptms_impute_with_imputer(
+          imputer_ref,
           X_val[, ref_feats, drop = FALSE],
-          k = 5
+          exclude_self = FALSE
         )
 
         # Require exactly the trained feature set for this model.

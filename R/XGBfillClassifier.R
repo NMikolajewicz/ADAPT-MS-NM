@@ -10,6 +10,15 @@ library(caret)
 library(pROC)
 library(VIM)
 
+if (!exists(".adaptms_impute_dataset", mode = "function")) {
+  util_candidates <- c(file.path("R", "ImputationUtils.R"), "ImputationUtils.R")
+  util_path <- util_candidates[file.exists(util_candidates)][1]
+  if (is.na(util_path)) {
+    stop("Missing required utility file: R/ImputationUtils.R")
+  }
+  source(util_path)
+}
+
 .prepare_binary_eval_xgb <- function(predictions, category1, category2, context) {
   true_labels <- sapply(predictions, function(x) as.character(x$true_label))
   pred_probs <- as.numeric(sapply(predictions, function(x) x$prob))
@@ -255,9 +264,8 @@ XGBRFClassifierDF <- setRefClass(
       training_data <<- X_filtered
       training_targets <<- y_filtered
 
-      # Impute for feature selection only
-      X_imputed <- as.data.frame(kNN(X_filtered, k = 5, imp_var = FALSE))
-      rownames(X_imputed) <- rownames(X_filtered)
+      # Fast KNN-style imputation for feature selection only.
+      X_imputed <- .adaptms_impute_dataset(X_filtered, k = 5)
 
       mean_fpr <- seq(0, 1, length.out = 100)
       all_tprs <- matrix(nrow = 0, ncol = 100)
@@ -518,8 +526,7 @@ XGBRFClassifierFolder <- setRefClass(
       training_data <<- X_filtered
       training_targets <<- y_filtered
 
-      X_imputed <- as.data.frame(kNN(X_filtered, k = 5, imp_var = FALSE))
-      rownames(X_imputed) <- rownames(X_filtered)
+      X_imputed <- .adaptms_impute_dataset(X_filtered, k = 5)
 
       mean_fpr <- seq(0, 1, length.out = 100)
       all_tprs <- matrix(nrow = 0, ncol = 100)

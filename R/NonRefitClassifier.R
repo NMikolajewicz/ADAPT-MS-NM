@@ -8,6 +8,15 @@ library(caret)
 library(pROC)
 library(VIM)
 
+if (!exists(".adaptms_impute_dataset", mode = "function")) {
+  util_candidates <- c(file.path("R", "ImputationUtils.R"), "ImputationUtils.R")
+  util_path <- util_candidates[file.exists(util_candidates)][1]
+  if (is.na(util_path)) {
+    stop("Missing required utility file: R/ImputationUtils.R")
+  }
+  source(util_path)
+}
+
 NonRefitClassifier <- setRefClass(
   "NonRefitClassifier",
   fields = list(
@@ -40,11 +49,10 @@ NonRefitClassifier <- setRefClass(
       d_ML <- cbind(.self$prot_df[shared_ids, , drop = FALSE],
                     .self$cat_df[shared_ids, , drop = FALSE])
 
-      # KNN impute
+      # Fast KNN-style imputation (configurable via ADAPTMS_IMPUTE_METHOD).
       feat_cols <- setdiff(colnames(d_ML), between)
       X_raw <- d_ML[, feat_cols, drop = FALSE]
-      X_imputed <- as.data.frame(kNN(X_raw, k = 5, imp_var = FALSE))
-      rownames(X_imputed) <- rownames(X_raw)
+      X_imputed <- .adaptms_impute_dataset(X_raw, k = 5)
 
       y <- d_ML[[between]]
 
@@ -183,8 +191,7 @@ NonRefitClassifier <- setRefClass(
 
       feat_cols <- setdiff(colnames(val_data), between)
       X_val_raw <- val_data[, feat_cols, drop = FALSE]
-      X_val_imp <- as.data.frame(kNN(X_val_raw, k = 5, imp_var = FALSE))
-      rownames(X_val_imp) <- rownames(X_val_raw)
+      X_val_imp <- .adaptms_impute_dataset(X_val_raw, k = 5)
 
       y_val <- val_data[[between]]
       keep <- y_val %in% c(category1, category2)

@@ -9,6 +9,15 @@ library(caret)
 library(pROC)
 library(VIM)
 
+if (!exists(".adaptms_impute_dataset", mode = "function")) {
+  util_candidates <- c(file.path("R", "ImputationUtils.R"), "ImputationUtils.R")
+  util_path <- util_candidates[file.exists(util_candidates)][1]
+  if (is.na(util_path)) {
+    stop("Missing required utility file: R/ImputationUtils.R")
+  }
+  source(util_path)
+}
+
 .prepare_binary_eval <- function(predictions, category1, category2, context) {
   true_labels <- sapply(predictions, function(x) as.character(x$true_label))
   pred_probs <- as.numeric(sapply(predictions, function(x) x$prob))
@@ -267,9 +276,8 @@ AdaptmsClassifierDF <- setRefClass(
         ))
       }
 
-      # KNN impute the filtered data
-      X_imputed <- as.data.frame(kNN(X_filtered, k = 5, imp_var = FALSE))
-      rownames(X_imputed) <- rownames(X_filtered)
+      # Fast KNN-style imputation (configurable via ADAPTMS_IMPUTE_METHOD).
+      X_imputed <- .adaptms_impute_dataset(X_filtered, k = 5)
 
       # Store training data
       training_data <<- X_imputed
@@ -534,9 +542,8 @@ AdaptmsClassifierFolder <- setRefClass(
       X_unimputed[] <- lapply(X_unimputed, function(x) as.numeric(as.character(x)))
       y <- d_ML[[between]]
 
-      # KNN impute
-      X_imputed <- as.data.frame(kNN(X_unimputed, k = 5, imp_var = FALSE))
-      rownames(X_imputed) <- rownames(X_unimputed)
+      # Fast KNN-style imputation (configurable via ADAPTMS_IMPUTE_METHOD).
+      X_imputed <- .adaptms_impute_dataset(X_unimputed, k = 5)
 
       # Filter to categories
       keep <- y %in% c(category1, category2)

@@ -10,6 +10,15 @@ library(pROC)
 library(VIM)
 library(nnet)
 
+if (!exists(".adaptms_impute_dataset", mode = "function")) {
+  util_candidates <- c(file.path("R", "ImputationUtils.R"), "ImputationUtils.R")
+  util_path <- util_candidates[file.exists(util_candidates)][1]
+  if (is.na(util_path)) {
+    stop("Missing required utility file: R/ImputationUtils.R")
+  }
+  source(util_path)
+}
+
 .resolve_n_jobs_multi <- function(n_jobs) {
   nj <- suppressWarnings(as.integer(n_jobs))
   if (is.na(nj)) nj <- 1L
@@ -169,10 +178,9 @@ AdaptmsMulticlassClassifier <- setRefClass(
         ))
       }
 
-      # KNN impute
+      # Fast KNN-style imputation (configurable via ADAPTMS_IMPUTE_METHOD).
       X_raw <- d_ML[, colnames(d_ML) != between_column, drop = FALSE]
-      X_imputed <- as.data.frame(kNN(X_raw, k = 5, imp_var = FALSE))
-      rownames(X_imputed) <- rownames(X_raw)
+      X_imputed <- .adaptms_impute_dataset(X_raw, k = 5)
       training_data <<- X_imputed
       sample_model_cache <<- new.env(parent = emptyenv())
 
