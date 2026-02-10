@@ -74,6 +74,20 @@ if (!exists(".adaptms_impute_dataset", mode = "function")) {
   make.unique(ids)
 }
 
+.normalize_sample_id_adapt <- function(x) {
+  ids <- trimws(as.character(x))
+  ids <- basename(ids)
+  ids <- sub("\\.raw\\.PG\\.Quantity$", "", ids, ignore.case = TRUE)
+  ids <- sub("\\.raw$", "", ids, ignore.case = TRUE)
+  ids <- sub("\\.mzML$", "", ids, ignore.case = TRUE)
+  ids <- sub("\\.mzXML$", "", ids, ignore.case = TRUE)
+  ids <- sub("\\.wiff$", "", ids, ignore.case = TRUE)
+  ids <- sub("\\.d$", "", ids, ignore.case = TRUE)
+  ids <- sub("\\.pg_matrix$", "", ids, ignore.case = TRUE)
+  ids <- sub("\\.tsv$", "", ids, ignore.case = TRUE)
+  ids
+}
+
 .resolve_n_jobs <- function(n_jobs) {
   nj <- suppressWarnings(as.integer(n_jobs))
   if (is.na(nj)) nj <- 1L
@@ -643,7 +657,7 @@ AdaptmsClassifierFolder <- setRefClass(
       }
 
       available_features <- .self$selected_features[.self$selected_features %in% colnames(d_sample)]
-      if (length(available_features) < 2) return(invisible(NULL))
+      if (length(available_features) < 2) return(invisible(FALSE))
       d_sample_filt <- d_sample[, available_features, drop = FALSE]
       d_sample_filt[is.na(d_sample_filt)] <- 0
 
@@ -673,11 +687,23 @@ AdaptmsClassifierFolder <- setRefClass(
         predictions[[length(predictions) + 1]] <<- list(
           sample = rownames(d_sample)[1], true_label = true_label, prob = as.numeric(prob)
         )
+        return(invisible(TRUE))
       }
+      invisible(FALSE)
     },
 
     classify_directory = function(directory, cat_validation_pool_SF, category1, category2) {
       files <- list.files(directory, pattern = "mzML\\.pg_matrix\\.tsv$", full.names = TRUE)
+      if (length(files) == 0) {
+        message(sprintf("No single-file result files found in '%s'.", directory))
+        return(invisible(NULL))
+      }
+
+      meta_ids <- rownames(cat_validation_pool_SF)
+      meta_ids_norm <- .normalize_sample_id_adapt(meta_ids)
+      metadata_matches <- 0L
+      category_matches <- 0L
+      predicted_count <- 0L
 
       for (fpath in files) {
         fname <- basename(fpath)
@@ -699,16 +725,29 @@ AdaptmsClassifierFolder <- setRefClass(
         })
 
         # Transpose: 1 row = 1 sample
-        d_sample <- as.data.frame(t(d_sample))
+        d_sample <- as.data.frame(t(d_sample), check.names = FALSE, stringsAsFactors = FALSE)
         sample_name <- rownames(d_sample)[1]
+        sample_name_norm <- .normalize_sample_id_adapt(sample_name)
 
-        if (sample_name %in% rownames(cat_validation_pool_SF)) {
-          true_label <- cat_validation_pool_SF[sample_name, between]
-          if (true_label %in% c(category1, category2)) {
-            classify_sample(d_sample, true_label)
-          }
+        match_idx <- which(meta_ids == sample_name | meta_ids_norm == sample_name_norm)
+        if (length(match_idx) == 0) next
+        metadata_matches <- metadata_matches + 1L
+
+        matched_id <- meta_ids[match_idx[1]]
+        true_label <- as.character(cat_validation_pool_SF[matched_id, between, drop = TRUE])[1]
+        if (!(true_label %in% c(category1, category2))) next
+        category_matches <- category_matches + 1L
+
+        rownames(d_sample) <- matched_id
+        if (isTRUE(classify_sample(d_sample, true_label))) {
+          predicted_count <- predicted_count + 1L
         }
       }
+
+      message(sprintf(
+        "Directory classification summary: files=%d, metadata_matches=%d, class_matches=%d, predictions=%d",
+        length(files), metadata_matches, category_matches, predicted_count
+      ))
     },
 
     plot_accumulated_roc = function(category1, category2) {
