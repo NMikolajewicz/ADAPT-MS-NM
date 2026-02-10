@@ -7,12 +7,17 @@ from sklearn.feature_selection import SelectFromModel
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import KNNImputer
 from sklearn.metrics import roc_curve, roc_auc_score
-from scipy.stats import ttest_ind
-from statsmodels.stats.multitest import multipletests
 import matplotlib.pyplot as plt
-from numpy import interp
 from matplotlib.backends.backend_pdf import PdfPages
 import xgboost as xgb
+
+
+def _extract_label(value):
+    if isinstance(value, pd.Series):
+        return value.iloc[0]
+    if isinstance(value, np.ndarray):
+        return value[0]
+    return value
 
 class XGBRFClassifierDF:
     def __init__(self, prot_df, cat_df, gene_dict, between=None):
@@ -32,7 +37,7 @@ class XGBRFClassifierDF:
         self.selected_features = None  # Store selected feature names
         self.fill_na = None  # Store NaN handling strategy for validation
 
-    def classify_and_plot(self, category1, category2, n_runs=10, n_estimators_rf=200):
+    def classify_and_plot(self, category1, category2, n_runs=10, n_estimators_rf=200, n_jobs=1):
         """
         Train XGBoost classifier with Random Forest feature selection
         
@@ -71,29 +76,27 @@ class XGBRFClassifierDF:
         # Impute missing values for feature selection only
         imputer = KNNImputer(n_neighbors=5)
         X_imputed = imputer.fit_transform(X_filtered)
-        X_imputed_df = pd.DataFrame(X_imputed, index=X_filtered.index, columns=X_filtered.columns)
 
         mean_fpr = np.linspace(0, 1, 100)
         all_tprs = []
         aucs = []
         
-        # Collect all selected features across runs
-        all_selected_features = set()
-
         for i in range(n_runs):
-            # Split into training and test sets
-            X_train_imp, X_test_imp, y_train, y_test = train_test_split(
-                X_imputed, y_filtered, test_size=0.2, stratify=y_filtered, random_state=i
+            # Single split index to align imputed and raw matrices without duplicate splitting work.
+            sample_idx = np.arange(X_filtered.shape[0])
+            train_idx, test_idx = train_test_split(
+                sample_idx, test_size=0.2, stratify=y_filtered, random_state=i
             )
-            
-            # Also get the raw data splits for XGB training
-            X_train_raw, X_test_raw, _, _ = train_test_split(
-                X_filtered, y_filtered, test_size=0.2, stratify=y_filtered, random_state=i
-            )
+            X_train_imp = X_imputed[train_idx]
+            X_test_imp = X_imputed[test_idx]
+            X_train_raw = X_filtered.iloc[train_idx]
+            X_test_raw = X_filtered.iloc[test_idx]
+            y_train = y_filtered.iloc[train_idx]
+            y_test = y_filtered.iloc[test_idx]
 
             # Feature selection using Random Forest on imputed data
             selector = SelectFromModel(
-                RandomForestClassifier(n_estimators=n_estimators_rf, random_state=i)
+                RandomForestClassifier(n_estimators=n_estimators_rf, random_state=i, n_jobs=n_jobs)
             )
             selector.fit(X_train_imp, y_train)
             
@@ -102,7 +105,6 @@ class XGBRFClassifierDF:
             
             # Get selected feature names
             selected_features = X_filtered.columns[selector.get_support()]
-            all_selected_features.update(selected_features)
             
             # Extract selected features from raw data (with NaNs)
             X_train_selected = X_train_raw[selected_features].copy()
@@ -117,6 +119,7 @@ class XGBRFClassifierDF:
                 random_state=i,
                 use_label_encoder=False,
                 eval_metric='logloss',
+                n_jobs=n_jobs,
                 missing=np.nan  # Explicitly handle NaN values
             )
             self.models.append(model)
@@ -148,7 +151,7 @@ class XGBRFClassifierDF:
 
         # Train final selector on all imputed data
         self.final_selector = SelectFromModel(
-            RandomForestClassifier(n_estimators=n_estimators_rf, random_state=42)
+            RandomForestClassifier(n_estimators=n_estimators_rf, random_state=42, n_jobs=n_jobs)
         )
         self.final_selector.fit(X_imputed, self.training_targets)
         
@@ -166,6 +169,7 @@ class XGBRFClassifierDF:
             random_state=42,
             use_label_encoder=False,
             eval_metric='logloss',
+            n_jobs=n_jobs,
             missing=np.nan  # Explicitly handle NaN values
         )
         self.final_model.fit(X_final, self.training_targets)
@@ -207,32 +211,15 @@ class XGBRFClassifierDF:
             raise ValueError("No trained model available. Run 'classify_and_plot' first.")
         
         self.fill_na = fill_na
-        
-        for idx, row in tqdm(validation_df.iterrows()):
-            # Create a sample with all selected features, initialized with NaN
-            d_sample = pd.DataFrame(index=[idx], columns=self.selected_features, dtype=np.float64)
-            
-            # Fill in values for features that exist in the validation sample
-            for feature in self.selected_features:
-                if feature in row.index:
-                    d_sample.loc[idx, feature] = float(row[feature]) if pd.notna(row[feature]) else np.nan
-                else:
-                    # Feature not present in validation sample, will be NaN
-                    d_sample.loc[idx, feature] = np.nan
-            
-            # Handle NaN values according to strategy
-            if self.fill_na == 'zero':
-                d_sample = d_sample.fillna(0)
-            # If 'keep', XGBoost will handle NaNs natively
-            
-            # Ensure all columns are float type
-            d_sample = d_sample.astype(np.float64)
-            
-            # Get true label
-            true_label = validation_cat_df.loc[idx, self.between]
 
-            # Predict probability using the final trained model
-            prob = self.final_model.predict_proba(d_sample)[:, 1][0]
+        validation_aligned = validation_df.reindex(columns=self.selected_features).apply(pd.to_numeric, errors='coerce')
+        if self.fill_na == 'zero':
+            validation_aligned = validation_aligned.fillna(0)
+        validation_aligned = validation_aligned.astype(np.float64)
+
+        probs = self.final_model.predict_proba(validation_aligned)[:, 1]
+        for idx, prob in tqdm(zip(validation_aligned.index, probs), total=len(validation_aligned)):
+            true_label = _extract_label(validation_cat_df.loc[idx, self.between])
             self.predictions.append((idx, true_label, prob))
 
     def plot_validation_roc(self, category1, category2):
@@ -305,7 +292,7 @@ class XGBRFClassifierFolder:
         self.selected_features = None  # Store selected feature names
         self.fill_na = None  # Store NaN handling strategy for validation
 
-    def classify_and_plot(self, category1, category2, n_runs=10, n_estimators_rf=200):
+    def classify_and_plot(self, category1, category2, n_runs=10, n_estimators_rf=200, n_jobs=1):
         """
         Train XGBoost classifier with Random Forest feature selection
         
@@ -343,26 +330,27 @@ class XGBRFClassifierFolder:
         # Impute missing values for feature selection only
         imputer = KNNImputer(n_neighbors=5)
         X_imputed = imputer.fit_transform(X_filtered)
-        X_imputed_df = pd.DataFrame(X_imputed, index=X_filtered.index, columns=X_filtered.columns)
 
         mean_fpr = np.linspace(0, 1, 100)
         all_tprs = []
         aucs = []
 
         for i in range(n_runs):
-            # Split into training and test sets
-            X_train_imp, X_test_imp, y_train, y_test = train_test_split(
-                X_imputed, y_filtered, test_size=0.2, stratify=y_filtered, random_state=i
+            # Single split index to align imputed and raw matrices without duplicate splitting work.
+            sample_idx = np.arange(X_filtered.shape[0])
+            train_idx, test_idx = train_test_split(
+                sample_idx, test_size=0.2, stratify=y_filtered, random_state=i
             )
-            
-            # Also get the raw data splits for XGB training
-            X_train_raw, X_test_raw, _, _ = train_test_split(
-                X_filtered, y_filtered, test_size=0.2, stratify=y_filtered, random_state=i
-            )
+            X_train_imp = X_imputed[train_idx]
+            X_test_imp = X_imputed[test_idx]
+            X_train_raw = X_filtered.iloc[train_idx]
+            X_test_raw = X_filtered.iloc[test_idx]
+            y_train = y_filtered.iloc[train_idx]
+            y_test = y_filtered.iloc[test_idx]
 
             # Feature selection using Random Forest on imputed data
             selector = SelectFromModel(
-                RandomForestClassifier(n_estimators=n_estimators_rf, random_state=i)
+                RandomForestClassifier(n_estimators=n_estimators_rf, random_state=i, n_jobs=n_jobs)
             )
             selector.fit(X_train_imp, y_train)
             
@@ -385,6 +373,7 @@ class XGBRFClassifierFolder:
                 random_state=i,
                 use_label_encoder=False,
                 eval_metric='logloss',
+                n_jobs=n_jobs,
                 missing=np.nan  # Explicitly handle NaN values
             )
             self.models.append(model)
@@ -400,7 +389,7 @@ class XGBRFClassifierFolder:
                 model.fit(X_cv_train, y_cv_train)
                 probas_ = model.predict_proba(X_cv_val)
                 fpr, tpr, _ = roc_curve(y_cv_val, probas_[:, 1])
-                tprs.append(interp(mean_fpr, fpr, tpr))
+                tprs.append(np.interp(mean_fpr, fpr, tpr))
                 tprs[-1][0] = 0.0
 
             # Final train on the whole training set
@@ -415,7 +404,7 @@ class XGBRFClassifierFolder:
 
         # Train final selector on all imputed data
         self.final_selector = SelectFromModel(
-            RandomForestClassifier(n_estimators=n_estimators_rf, random_state=42)
+            RandomForestClassifier(n_estimators=n_estimators_rf, random_state=42, n_jobs=n_jobs)
         )
         self.final_selector.fit(X_imputed, self.training_targets)
         
@@ -433,6 +422,7 @@ class XGBRFClassifierFolder:
             random_state=42,
             use_label_encoder=False,
             eval_metric='logloss',
+            n_jobs=n_jobs,
             missing=np.nan  # Explicitly handle NaN values
         )
         self.final_model.fit(X_final, self.training_targets)
@@ -464,16 +454,7 @@ class XGBRFClassifierFolder:
         if self.final_model is None or self.selected_features is None:
             raise ValueError("No trained model available. Run 'classify_and_plot' first.")
 
-        # Create a sample with all selected features, initialized with NaN
-        d_sample_aligned = pd.DataFrame(index=d_sample.index, columns=self.selected_features, dtype=np.float64)
-        
-        # Fill in values for features that exist in the sample
-        for feature in self.selected_features:
-            if feature in d_sample.columns:
-                d_sample_aligned.loc[:, feature] = float(d_sample[feature].iloc[0]) if pd.notna(d_sample[feature].iloc[0]) else np.nan
-            else:
-                # Feature not present in sample, will be NaN
-                d_sample_aligned.loc[:, feature] = np.nan
+        d_sample_aligned = d_sample.reindex(columns=self.selected_features).apply(pd.to_numeric, errors='coerce')
         
         # Handle NaN values according to strategy
         if self.fill_na == 'zero':

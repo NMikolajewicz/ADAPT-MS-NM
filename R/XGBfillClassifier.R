@@ -53,6 +53,119 @@ library(VIM)
   parsed
 }
 
+.resolve_n_jobs_xgb <- function(n_jobs) {
+  nj <- suppressWarnings(as.integer(n_jobs))
+  if (is.na(nj)) nj <- 1L
+  if (nj <= 0L) {
+    detected <- suppressWarnings(parallel::detectCores(logical = FALSE))
+    if (is.na(detected) || detected < 1L) detected <- 1L
+    nj <- detected
+  }
+  nj
+}
+
+.parallel_lapply_xgb <- function(X, FUN, n_jobs = 1L) {
+  nj <- .resolve_n_jobs_xgb(n_jobs)
+  if (length(X) <= 1L || nj <= 1L || .Platform$OS.type == "windows") {
+    return(lapply(X, FUN))
+  }
+  parallel::mclapply(X, FUN, mc.cores = min(length(X), nj))
+}
+
+.run_xgb_rf_iteration <- function(seed, X_filtered, X_imputed, y_filtered,
+                                  n_estimators_rf, xgb_nrounds, cv_folds,
+                                  xgb_nthread = 1L) {
+  set.seed(seed - 1L)
+  train_idx <- createDataPartition(factor(y_filtered, levels = c(0, 1)),
+                                   p = 0.8, list = FALSE)[, 1]
+
+  X_train_imp <- as.matrix(X_imputed[train_idx, , drop = FALSE])
+  X_train_raw <- X_filtered[train_idx, , drop = FALSE]
+  X_test_raw <- X_filtered[-train_idx, , drop = FALSE]
+  y_train <- y_filtered[train_idx]
+  y_test <- y_filtered[-train_idx]
+
+  rf_model <- randomForest(
+    x = X_train_imp, y = factor(y_train),
+    ntree = n_estimators_rf, importance = TRUE
+  )
+  imp_obj <- importance(rf_model, type = 1)
+  imp_vals <- if (is.null(dim(imp_obj))) {
+    vals <- as.numeric(imp_obj)
+    names(vals) <- colnames(X_train_imp)
+    vals
+  } else {
+    imp_obj[, 1]
+  }
+  sel_feats <- names(imp_vals[imp_vals > mean(imp_vals, na.rm = TRUE)])
+  if (length(sel_feats) < 2) {
+    sel_feats <- names(sort(imp_vals, decreasing = TRUE))[1:min(10, length(imp_vals))]
+  }
+  sel_feats <- unique(sel_feats[!is.na(sel_feats)])
+  if (length(sel_feats) == 0) return(NULL)
+
+  X_train_sel <- as.matrix(X_train_raw[, sel_feats, drop = FALSE])
+  X_test_sel <- as.matrix(X_test_raw[, sel_feats, drop = FALSE])
+
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    max_depth = 6,
+    eta = 0.1,
+    nthread = xgb_nthread
+  )
+
+  dtrain <- xgb.DMatrix(data = X_train_sel, label = y_train)
+  xgb_model <- xgb.train(params = params, data = dtrain, nrounds = xgb_nrounds, verbose = 0)
+
+  min_class <- min(sum(y_train == 0), sum(y_train == 1))
+  if (min_class < 2L) {
+    folds <- list()
+  } else {
+    k_folds <- min(cv_folds, min_class)
+    folds <- createFolds(y_train, k = k_folds, list = TRUE, returnTrain = TRUE)
+  }
+  mean_fpr <- seq(0, 1, length.out = 100)
+  cv_tprs <- matrix(nrow = 0, ncol = 100)
+
+  for (fold_train_idx in folds) {
+    fold_val_idx <- setdiff(seq_along(y_train), fold_train_idx)
+    dcv_train <- xgb.DMatrix(data = X_train_sel[fold_train_idx, , drop = FALSE],
+                             label = y_train[fold_train_idx])
+    dcv_val <- xgb.DMatrix(data = X_train_sel[fold_val_idx, , drop = FALSE])
+    y_cv_val <- y_train[fold_val_idx]
+
+    cv_model <- xgb.train(params = params, data = dcv_train, nrounds = xgb_nrounds, verbose = 0)
+    probas <- predict(cv_model, dcv_val)
+
+    if (length(unique(y_cv_val)) > 1) {
+      roc_obj <- roc(y_cv_val, probas, quiet = TRUE)
+      interp_tpr <- approx(1 - roc_obj$specificities, roc_obj$sensitivities,
+                           xout = mean_fpr, rule = 2)$y
+      interp_tpr[1] <- 0
+      cv_tprs <- rbind(cv_tprs, interp_tpr)
+    }
+  }
+
+  dtest <- xgb.DMatrix(data = X_test_sel)
+  test_probs <- predict(xgb_model, dtest)
+  auc_val <- if (length(unique(y_test)) > 1) {
+    as.numeric(auc(roc(y_test, test_probs, quiet = TRUE)))
+  } else {
+    NA_real_
+  }
+
+  mean_tpr <- if (nrow(cv_tprs) > 0) {
+    out <- colMeans(cv_tprs)
+    out[100] <- 1.0
+    out
+  } else {
+    NULL
+  }
+
+  list(model = xgb_model, sel_feats = sel_feats, mean_tpr = mean_tpr, auc = auc_val)
+}
+
 # -----------------------------------------------------------------------------
 # XGBRFClassifierDF
 # DataFrame-based variant
@@ -96,7 +209,7 @@ XGBRFClassifierDF <- setRefClass(
       fill_na <<- NULL
     },
 
-    classify_and_plot = function(category1, category2, n_runs = 10, n_estimators_rf = 200) {
+    classify_and_plot = function(category1, category2, n_runs = 10, n_estimators_rf = 200, n_jobs = 1) {
       if (between == "") {
         stop("No between variable given. Please provide a variable for classification.")
       }
@@ -104,6 +217,9 @@ XGBRFClassifierDF <- setRefClass(
       n_estimators_rf <- .get_env_int_xgb("ADAPTMS_RF_TREES", n_estimators_rf, min_value = 1L)
       xgb_nrounds <- .get_env_int_xgb("ADAPTMS_XGB_NROUNDS", 100L, min_value = 1L)
       cv_folds <- .get_env_int_xgb("ADAPTMS_CV_FOLDS", 5L, min_value = 2L)
+      run_n_jobs <- .resolve_n_jobs_xgb(n_jobs)
+      xgb_nthread_default <- if (run_n_jobs > 1L) 1L else run_n_jobs
+      xgb_nthread <- .get_env_int_xgb("ADAPTMS_XGB_NTHREADS", xgb_nthread_default, min_value = 1L)
 
       # Drop all-NA columns
       all_na_cols <- sapply(.self$prot_df, function(x) all(is.na(x)))
@@ -147,85 +263,28 @@ XGBRFClassifierDF <- setRefClass(
       all_tprs <- matrix(nrow = 0, ncol = 100)
       aucs <- numeric(0)
 
-      for (i in seq_len(n_runs)) {
-        set.seed(i - 1)
-        train_idx <- createDataPartition(factor(y_filtered, levels = c(0, 1)),
-                                         p = 0.8, list = FALSE)[, 1]
+      run_results <- .parallel_lapply_xgb(
+        seq_len(n_runs),
+        function(i) .run_xgb_rf_iteration(
+          seed = i,
+          X_filtered = X_filtered,
+          X_imputed = X_imputed,
+          y_filtered = y_filtered,
+          n_estimators_rf = n_estimators_rf,
+          xgb_nrounds = xgb_nrounds,
+          cv_folds = cv_folds,
+          xgb_nthread = xgb_nthread
+        ),
+        n_jobs = run_n_jobs
+      )
 
-        X_train_imp <- as.matrix(X_imputed[train_idx, , drop = FALSE])
-        X_test_imp  <- as.matrix(X_imputed[-train_idx, , drop = FALSE])
-        X_train_raw <- X_filtered[train_idx, , drop = FALSE]
-        X_test_raw  <- X_filtered[-train_idx, , drop = FALSE]
-        y_train <- y_filtered[train_idx]
-        y_test  <- y_filtered[-train_idx]
-
-        # RF feature selection on imputed data
-        rf_model <- randomForest(
-          x = X_train_imp, y = factor(y_train),
-          ntree = n_estimators_rf, importance = TRUE
-        )
-        importance_vals <- importance(rf_model, type = 1)[, 1]
-        sel_feats <- names(importance_vals[importance_vals > mean(importance_vals)])
-        if (length(sel_feats) < 2) {
-          sel_feats <- names(sort(importance_vals, decreasing = TRUE))[1:min(10, length(importance_vals))]
-        }
-        selectors[[length(selectors) + 1]] <<- sel_feats
-
-        # Train XGBoost on raw data (XGBoost handles NaN natively)
-        X_train_sel <- as.matrix(X_train_raw[, sel_feats, drop = FALSE])
-        X_test_sel  <- as.matrix(X_test_raw[, sel_feats, drop = FALSE])
-
-        dtrain <- xgb.DMatrix(data = X_train_sel, label = y_train)
-
-        params <- list(
-          objective = "binary:logistic",
-          eval_metric = "logloss",
-          max_depth = 6,
-          eta = 0.1
-        )
-
-        xgb_model <- xgb.train(params = params, data = dtrain, nrounds = xgb_nrounds, verbose = 0)
-        models[[length(models) + 1]] <<- xgb_model
-
-        # 5-fold CV
-        k_folds <- max(2L, min(cv_folds, length(y_train)))
-        folds <- createFolds(y_train, k = k_folds, list = TRUE, returnTrain = TRUE)
-        cv_tprs <- matrix(nrow = 0, ncol = 100)
-
-        for (fold_train_idx in folds) {
-          fold_val_idx <- setdiff(seq_along(y_train), fold_train_idx)
-          dcv_train <- xgb.DMatrix(data = X_train_sel[fold_train_idx, , drop = FALSE],
-                                    label = y_train[fold_train_idx])
-          dcv_val <- xgb.DMatrix(data = X_train_sel[fold_val_idx, , drop = FALSE])
-          y_cv_val <- y_train[fold_val_idx]
-
-          cv_model <- xgb.train(params = params, data = dcv_train, nrounds = xgb_nrounds, verbose = 0)
-          probas <- predict(cv_model, dcv_val)
-
-          if (length(unique(y_cv_val)) > 1) {
-            roc_obj <- roc(y_cv_val, probas, quiet = TRUE)
-            interp_tpr <- approx(1 - roc_obj$specificities, roc_obj$sensitivities,
-                                  xout = mean_fpr, rule = 2)$y
-            interp_tpr[1] <- 0
-            cv_tprs <- rbind(cv_tprs, interp_tpr)
-          }
-        }
-
-        # Test AUC
-        dtest <- xgb.DMatrix(data = X_test_sel)
-        test_probs <- predict(xgb_model, dtest)
-        if (length(unique(y_test)) > 1) {
-          test_roc <- roc(y_test, test_probs, quiet = TRUE)
-          auc_val <- as.numeric(auc(test_roc))
-        } else {
-          auc_val <- NA
-        }
-        aucs <- c(aucs, auc_val)
-
-        if (nrow(cv_tprs) > 0) {
-          mean_tpr_fold <- colMeans(cv_tprs)
-          mean_tpr_fold[100] <- 1.0
-          all_tprs <- rbind(all_tprs, mean_tpr_fold)
+      for (res in run_results) {
+        if (is.null(res)) next
+        selectors[[length(selectors) + 1]] <<- res$sel_feats
+        models[[length(models) + 1]] <<- res$model
+        aucs <- c(aucs, res$auc)
+        if (!is.null(res$mean_tpr)) {
+          all_tprs <- rbind(all_tprs, res$mean_tpr)
         }
       }
 
@@ -245,7 +304,14 @@ XGBRFClassifierDF <- setRefClass(
       # Train final XGBoost on raw data with selected features
       X_final <- as.matrix(.self$training_data[, selected_features, drop = FALSE])
       dfinal <- xgb.DMatrix(data = X_final, label = y_filtered)
-      final_model <<- xgb.train(params = params, data = dfinal, nrounds = xgb_nrounds, verbose = 0)
+      params_final <- list(
+        objective = "binary:logistic",
+        eval_metric = "logloss",
+        max_depth = 6,
+        eta = 0.1,
+        nthread = xgb_nthread
+      )
+      final_model <<- xgb.train(params = params_final, data = dfinal, nrounds = xgb_nrounds, verbose = 0)
 
       # Plot
       if (nrow(all_tprs) > 0) {
@@ -279,39 +345,32 @@ XGBRFClassifierDF <- setRefClass(
 
       fill_na <<- fill_na_strategy
       shared_ids <- intersect(rownames(validation_df), rownames(validation_cat_df))
+      if (length(shared_ids) == 0) return(invisible(NULL))
 
-      for (idx in shared_ids) {
-        row_data <- validation_df[idx, , drop = FALSE]
-
-        # Create aligned sample with all selected features
-        d_sample <- data.frame(matrix(NA_real_, nrow = 1, ncol = length(selected_features)))
-        colnames(d_sample) <- selected_features
-        rownames(d_sample) <- idx
-
-        for (feat in selected_features) {
-          if (feat %in% colnames(row_data) && !is.na(row_data[1, feat])) {
-            d_sample[1, feat] <- as.numeric(row_data[1, feat])
-          }
-        }
-
-        # Handle NaN strategy
-        if (fill_na_strategy == "zero") {
-          d_sample[is.na(d_sample)] <- 0
-        }
-        # If "keep", XGBoost handles NAs natively
-
-        true_label <- validation_cat_df[idx, between]
-
-        dmat <- xgb.DMatrix(data = as.matrix(d_sample))
-        prob <- predict(final_model, dmat)
-        predictions[[length(predictions) + 1]] <<- list(
-          sample = idx, true_label = true_label, prob = prob
-        )
-
-        if (length(.self$predictions) %% 10 == 0) {
-          message(sprintf("Classified %d samples...", length(.self$predictions)))
-        }
+      val_mat <- matrix(NA_real_, nrow = length(shared_ids), ncol = length(selected_features),
+                        dimnames = list(shared_ids, selected_features))
+      shared_features <- intersect(selected_features, colnames(validation_df))
+      if (length(shared_features) > 0) {
+        val_mat[, shared_features] <- as.matrix(validation_df[shared_ids, shared_features, drop = FALSE])
       }
+
+      if (fill_na_strategy == "zero") {
+        val_mat[is.na(val_mat)] <- 0
+      }
+
+      dmat <- xgb.DMatrix(data = val_mat)
+      probs <- as.numeric(predict(final_model, dmat))
+      true_labels <- validation_cat_df[shared_ids, between, drop = TRUE]
+
+      new_preds <- lapply(seq_along(shared_ids), function(i) {
+        list(
+          sample = shared_ids[i],
+          true_label = true_labels[i],
+          prob = probs[i]
+        )
+      })
+      predictions <<- c(predictions, new_preds)
+      message(sprintf("Classified %d samples...", length(.self$predictions)))
     },
 
     plot_validation_roc = function(category1, category2) {
@@ -416,7 +475,7 @@ XGBRFClassifierFolder <- setRefClass(
       fill_na <<- NULL
     },
 
-    classify_and_plot = function(category1, category2, n_runs = 10, n_estimators_rf = 200) {
+    classify_and_plot = function(category1, category2, n_runs = 10, n_estimators_rf = 200, n_jobs = 1) {
       if (between == "") {
         stop("No between variable given.")
       }
@@ -424,6 +483,9 @@ XGBRFClassifierFolder <- setRefClass(
       n_estimators_rf <- .get_env_int_xgb("ADAPTMS_RF_TREES", n_estimators_rf, min_value = 1L)
       xgb_nrounds <- .get_env_int_xgb("ADAPTMS_XGB_NROUNDS", 100L, min_value = 1L)
       cv_folds <- .get_env_int_xgb("ADAPTMS_CV_FOLDS", 5L, min_value = 2L)
+      run_n_jobs <- .resolve_n_jobs_xgb(n_jobs)
+      xgb_nthread_default <- if (run_n_jobs > 1L) 1L else run_n_jobs
+      xgb_nthread <- .get_env_int_xgb("ADAPTMS_XGB_NTHREADS", xgb_nthread_default, min_value = 1L)
 
       shared_ids <- intersect(rownames(.self$prot_df), rownames(.self$cat_df))
       d_ML <- cbind(.self$prot_df[shared_ids, , drop = FALSE],
@@ -463,80 +525,28 @@ XGBRFClassifierFolder <- setRefClass(
       all_tprs <- matrix(nrow = 0, ncol = 100)
       aucs <- numeric(0)
 
-      params <- list(
-        objective = "binary:logistic",
-        eval_metric = "logloss",
-        max_depth = 6,
-        eta = 0.1
+      run_results <- .parallel_lapply_xgb(
+        seq_len(n_runs),
+        function(i) .run_xgb_rf_iteration(
+          seed = i,
+          X_filtered = X_filtered,
+          X_imputed = X_imputed,
+          y_filtered = y_filtered,
+          n_estimators_rf = n_estimators_rf,
+          xgb_nrounds = xgb_nrounds,
+          cv_folds = cv_folds,
+          xgb_nthread = xgb_nthread
+        ),
+        n_jobs = run_n_jobs
       )
 
-      for (i in seq_len(n_runs)) {
-        set.seed(i - 1)
-        train_idx <- createDataPartition(factor(y_filtered, levels = c(0, 1)),
-                                         p = 0.8, list = FALSE)[, 1]
-
-        X_train_imp <- as.matrix(X_imputed[train_idx, , drop = FALSE])
-        X_train_raw <- X_filtered[train_idx, , drop = FALSE]
-        X_test_raw  <- X_filtered[-train_idx, , drop = FALSE]
-        y_train <- y_filtered[train_idx]
-        y_test  <- y_filtered[-train_idx]
-
-        rf_model <- randomForest(
-          x = X_train_imp, y = factor(y_train),
-          ntree = n_estimators_rf, importance = TRUE
-        )
-        imp_vals <- importance(rf_model, type = 1)[, 1]
-        sel_feats <- names(imp_vals[imp_vals > mean(imp_vals)])
-        if (length(sel_feats) < 2) {
-          sel_feats <- names(sort(imp_vals, decreasing = TRUE))[1:min(10, length(imp_vals))]
-        }
-        selectors[[length(selectors) + 1]] <<- sel_feats
-
-        X_train_sel <- as.matrix(X_train_raw[, sel_feats, drop = FALSE])
-        X_test_sel  <- as.matrix(X_test_raw[, sel_feats, drop = FALSE])
-
-        dtrain <- xgb.DMatrix(data = X_train_sel, label = y_train)
-        xgb_model <- xgb.train(params = params, data = dtrain, nrounds = xgb_nrounds, verbose = 0)
-        models[[length(models) + 1]] <<- xgb_model
-
-        # 5-fold CV
-        k_folds <- max(2L, min(cv_folds, length(y_train)))
-        folds <- createFolds(y_train, k = k_folds, list = TRUE, returnTrain = TRUE)
-        cv_tprs <- matrix(nrow = 0, ncol = 100)
-
-        for (fold_train_idx in folds) {
-          fold_val_idx <- setdiff(seq_along(y_train), fold_train_idx)
-          dcv_train <- xgb.DMatrix(data = X_train_sel[fold_train_idx, , drop = FALSE],
-                                    label = y_train[fold_train_idx])
-          dcv_val <- xgb.DMatrix(data = X_train_sel[fold_val_idx, , drop = FALSE])
-          y_cv_val <- y_train[fold_val_idx]
-
-          cv_model <- xgb.train(params = params, data = dcv_train, nrounds = xgb_nrounds, verbose = 0)
-          probas <- predict(cv_model, dcv_val)
-
-          if (length(unique(y_cv_val)) > 1) {
-            roc_obj <- roc(y_cv_val, probas, quiet = TRUE)
-            interp_tpr <- approx(1 - roc_obj$specificities, roc_obj$sensitivities,
-                                  xout = mean_fpr, rule = 2)$y
-            interp_tpr[1] <- 0
-            cv_tprs <- rbind(cv_tprs, interp_tpr)
-          }
-        }
-
-        dtest <- xgb.DMatrix(data = X_test_sel)
-        test_probs <- predict(xgb_model, dtest)
-        if (length(unique(y_test)) > 1) {
-          test_roc <- roc(y_test, test_probs, quiet = TRUE)
-          auc_val <- as.numeric(auc(test_roc))
-        } else {
-          auc_val <- NA
-        }
-        aucs <- c(aucs, auc_val)
-
-        if (nrow(cv_tprs) > 0) {
-          mean_tpr_fold <- colMeans(cv_tprs)
-          mean_tpr_fold[100] <- 1.0
-          all_tprs <- rbind(all_tprs, mean_tpr_fold)
+      for (res in run_results) {
+        if (is.null(res)) next
+        selectors[[length(selectors) + 1]] <<- res$sel_feats
+        models[[length(models) + 1]] <<- res$model
+        aucs <- c(aucs, res$auc)
+        if (!is.null(res$mean_tpr)) {
+          all_tprs <- rbind(all_tprs, res$mean_tpr)
         }
       }
 
@@ -555,7 +565,14 @@ XGBRFClassifierFolder <- setRefClass(
 
       X_final <- as.matrix(.self$training_data[, selected_features, drop = FALSE])
       dfinal <- xgb.DMatrix(data = X_final, label = y_filtered)
-      final_model <<- xgb.train(params = params, data = dfinal, nrounds = xgb_nrounds, verbose = 0)
+      params_final <- list(
+        objective = "binary:logistic",
+        eval_metric = "logloss",
+        max_depth = 6,
+        eta = 0.1,
+        nthread = xgb_nthread
+      )
+      final_model <<- xgb.train(params = params_final, data = dfinal, nrounds = xgb_nrounds, verbose = 0)
 
       if (nrow(all_tprs) > 0) {
         median_tpr <- apply(all_tprs, 2, median)
@@ -588,21 +605,18 @@ XGBRFClassifierFolder <- setRefClass(
 
       if (length(selected_features) == 0) return(invisible(NULL))
 
-      d_sample_aligned <- data.frame(matrix(NA_real_, nrow = 1, ncol = length(selected_features)))
-      colnames(d_sample_aligned) <- selected_features
-      rownames(d_sample_aligned) <- rownames(d_sample)[1]
-
-      for (feat in selected_features) {
-        if (feat %in% colnames(d_sample) && !is.na(d_sample[1, feat])) {
-          d_sample_aligned[1, feat] <- as.numeric(d_sample[1, feat])
-        }
+      d_sample_aligned <- matrix(NA_real_, nrow = 1, ncol = length(selected_features),
+                                 dimnames = list(rownames(d_sample)[1], selected_features))
+      shared_features <- intersect(selected_features, colnames(d_sample))
+      if (length(shared_features) > 0) {
+        d_sample_aligned[1, shared_features] <- as.numeric(d_sample[1, shared_features, drop = TRUE])
       }
 
       if (!is.null(fill_na) && fill_na == "zero") {
         d_sample_aligned[is.na(d_sample_aligned)] <- 0
       }
 
-      dmat <- xgb.DMatrix(data = as.matrix(d_sample_aligned))
+      dmat <- xgb.DMatrix(data = d_sample_aligned)
       prob <- predict(final_model, dmat)
       predictions[[length(predictions) + 1]] <<- list(
         sample = rownames(d_sample)[1], true_label = true_label, prob = prob

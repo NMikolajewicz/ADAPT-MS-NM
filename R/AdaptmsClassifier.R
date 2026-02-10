@@ -51,6 +51,145 @@ library(VIM)
   make.unique(ids)
 }
 
+.resolve_n_jobs <- function(n_jobs) {
+  nj <- suppressWarnings(as.integer(n_jobs))
+  if (is.na(nj)) nj <- 1L
+  if (nj <= 0L) {
+    detected <- suppressWarnings(parallel::detectCores(logical = FALSE))
+    if (is.na(detected) || detected < 1L) detected <- 1L
+    nj <- detected
+  }
+  nj
+}
+
+.parallel_lapply_adapt <- function(X, FUN, n_jobs = 1L) {
+  nj <- .resolve_n_jobs(n_jobs)
+  if (length(X) <= 1L || nj <= 1L || .Platform$OS.type == "windows") {
+    return(lapply(X, FUN))
+  }
+  parallel::mclapply(X, FUN, mc.cores = min(length(X), nj))
+}
+
+.numeric_matrix_adapt <- function(df) {
+  as.matrix(data.frame(
+    lapply(df, function(x) suppressWarnings(as.numeric(as.character(x)))),
+    check.names = FALSE
+  ))
+}
+
+.welch_pvalues_binary <- function(X_df, y_vec, min_non_na = 1L) {
+  X_mat <- .numeric_matrix_adapt(X_df)
+  group0 <- X_mat[y_vec == 0, , drop = FALSE]
+  group1 <- X_mat[y_vec == 1, , drop = FALSE]
+
+  n0 <- colSums(!is.na(group0))
+  n1 <- colSums(!is.na(group1))
+  valid <- n0 >= min_non_na & n1 >= min_non_na
+
+  m0 <- colMeans(group0, na.rm = TRUE)
+  m1 <- colMeans(group1, na.rm = TRUE)
+
+  centered0 <- sweep(group0, 2, m0, FUN = "-")
+  centered1 <- sweep(group1, 2, m1, FUN = "-")
+  centered0[is.na(centered0)] <- 0
+  centered1[is.na(centered1)] <- 0
+
+  v0 <- colSums(centered0 ^ 2) / pmax(n0 - 1, 1)
+  v1 <- colSums(centered1 ^ 2) / pmax(n1 - 1, 1)
+
+  se <- sqrt((v0 / pmax(n0, 1)) + (v1 / pmax(n1, 1)))
+  t_stat <- (m0 - m1) / se
+
+  df_num <- (v0 / pmax(n0, 1) + v1 / pmax(n1, 1)) ^ 2
+  df_den <- (v0 ^ 2) / (pmax(n0, 1) ^ 2 * pmax(n0 - 1, 1)) +
+    (v1 ^ 2) / (pmax(n1, 1) ^ 2 * pmax(n1 - 1, 1))
+  df <- df_num / df_den
+
+  p_values <- 2 * stats::pt(-abs(t_stat), df = df)
+  p_values[!is.finite(p_values)] <- 1.0
+  p_values[!valid] <- 1.0
+  as.numeric(p_values)
+}
+
+.run_binary_logreg_iteration <- function(seed, X_unimputed, X_imputed, y_vec,
+                                         topn_features = 50L, min_non_na = 1L) {
+  set.seed(seed - 1L)
+  train_idx <- createDataPartition(factor(y_vec, levels = c(0, 1)),
+                                   p = 0.8, list = FALSE)[, 1]
+
+  X_train_raw <- X_unimputed[train_idx, , drop = FALSE]
+  X_test_raw <- X_unimputed[-train_idx, , drop = FALSE]
+  y_train <- y_vec[train_idx]
+  y_test <- y_vec[-train_idx]
+
+  p_values <- .welch_pvalues_binary(X_train_raw, y_train, min_non_na = min_non_na)
+  corrected_p <- p.adjust(p_values, method = "BH")
+  top_idx <- order(corrected_p)[seq_len(min(topn_features, length(corrected_p)))]
+  top_feats <- colnames(X_train_raw)[top_idx]
+
+  X_train_sel <- X_imputed[rownames(X_train_raw), top_feats, drop = FALSE]
+  X_test_sel <- X_imputed[rownames(X_test_raw), top_feats, drop = FALSE]
+
+  train_df <- data.frame(X_train_sel, y = factor(y_train))
+  model <- tryCatch(
+    glm(y ~ ., data = train_df, family = binomial(link = "logit"),
+        control = list(maxit = 1000)),
+    error = function(e) NULL
+  )
+  if (is.null(model)) return(NULL)
+
+  min_class <- min(sum(y_train == 0), sum(y_train == 1))
+  if (min_class < 2L) {
+    folds <- list()
+  } else {
+    k_folds <- min(5L, min_class)
+    folds <- createFolds(y_train, k = k_folds, list = TRUE, returnTrain = TRUE)
+  }
+  mean_fpr <- seq(0, 1, length.out = 100)
+  cv_tprs <- matrix(nrow = 0, ncol = 100)
+
+  for (fold_train_idx in folds) {
+    fold_val_idx <- setdiff(seq_along(y_train), fold_train_idx)
+    cv_train_df <- data.frame(X_train_sel[fold_train_idx, , drop = FALSE],
+                              y = factor(y_train[fold_train_idx]))
+    cv_val_df <- X_train_sel[fold_val_idx, , drop = FALSE]
+    y_cv_val <- y_train[fold_val_idx]
+
+    cv_model <- tryCatch(
+      glm(y ~ ., data = cv_train_df, family = binomial(link = "logit"),
+          control = list(maxit = 1000)),
+      error = function(e) NULL
+    )
+    if (is.null(cv_model)) next
+
+    probas <- predict(cv_model, newdata = cv_val_df, type = "response")
+    if (length(unique(y_cv_val)) > 1) {
+      roc_obj <- roc(y_cv_val, probas, quiet = TRUE)
+      interp_tpr <- approx(1 - roc_obj$specificities, roc_obj$sensitivities,
+                           xout = mean_fpr, rule = 2)$y
+      interp_tpr[1] <- 0
+      cv_tprs <- rbind(cv_tprs, interp_tpr)
+    }
+  }
+
+  test_probs <- predict(model, newdata = X_test_sel, type = "response")
+  auc_val <- if (length(unique(y_test)) > 1) {
+    as.numeric(auc(roc(y_test, test_probs, quiet = TRUE)))
+  } else {
+    NA_real_
+  }
+
+  mean_tpr <- if (nrow(cv_tprs) > 0) {
+    out <- colMeans(cv_tprs)
+    out[100] <- 1.0
+    out
+  } else {
+    NULL
+  }
+
+  list(model = model, top_feats = top_feats, mean_tpr = mean_tpr, auc = auc_val)
+}
+
 # -----------------------------------------------------------------------------
 # AdaptmsClassifierDF
 # For validating against a data.frame of samples
@@ -69,7 +208,8 @@ AdaptmsClassifierDF <- setRefClass(
     predictions    = "list",
     feature_names  = "character",
     training_data  = "ANY",
-    training_targets = "ANY"
+    training_targets = "ANY",
+    sample_model_cache = "ANY"
   ),
   methods = list(
     initialize = function(prot_df, cat_df, gene_dict = NULL, between = NULL) {
@@ -85,9 +225,10 @@ AdaptmsClassifierDF <- setRefClass(
       feature_names <<- colnames(prot_df)
       training_data <<- NULL
       training_targets <<- NULL
+      sample_model_cache <<- new.env(parent = emptyenv())
     },
 
-    classify_and_plot = function(category1, category2, n_runs = 10, topn_features = 50) {
+    classify_and_plot = function(category1, category2, n_runs = 10, topn_features = 50, n_jobs = 1) {
       if (between == "") {
         stop("No between variable given. Please provide a variable for classification.")
       }
@@ -133,89 +274,32 @@ AdaptmsClassifierDF <- setRefClass(
       # Store training data
       training_data <<- X_imputed
       training_targets <<- y_filtered
+      sample_model_cache <<- new.env(parent = emptyenv())
 
       mean_fpr <- seq(0, 1, length.out = 100)
       all_tprs <- matrix(nrow = 0, ncol = 100)
       aucs <- numeric(0)
 
-      for (i in seq_len(n_runs)) {
-        set.seed(i - 1)
-        train_idx <- createDataPartition(factor(y_filtered, levels = c(0, 1)),
-                                         p = 0.8, list = FALSE)[, 1]
-        X_train_raw <- X_filtered[train_idx, , drop = FALSE]
-        X_test_raw  <- X_filtered[-train_idx, , drop = FALSE]
-        y_train <- y_filtered[train_idx]
-        y_test  <- y_filtered[-train_idx]
+      run_results <- .parallel_lapply_adapt(
+        seq_len(n_runs),
+        function(i) .run_binary_logreg_iteration(
+          seed = i,
+          X_unimputed = X_filtered,
+          X_imputed = X_imputed,
+          y_vec = y_filtered,
+          topn_features = topn_features,
+          min_non_na = 1L
+        ),
+        n_jobs = n_jobs
+      )
 
-        # Feature selection: t-tests on raw data (with NAs)
-        p_values <- sapply(colnames(X_train_raw), function(col) {
-          g1 <- X_train_raw[y_train == 0, col]
-          g2 <- X_train_raw[y_train == 1, col]
-          g1 <- g1[!is.na(g1)]
-          g2 <- g2[!is.na(g2)]
-          if (length(g1) > 0 && length(g2) > 0) {
-            tryCatch(t.test(g1, g2)$p.value, error = function(e) 1.0)
-          } else {
-            1.0
-          }
-        })
-
-        # FDR correction
-        corrected_p <- p.adjust(p_values, method = "BH")
-
-        # Select top features
-        top_idx <- order(corrected_p)[seq_len(min(topn_features, length(corrected_p)))]
-        top_feats <- colnames(X_train_raw)[top_idx]
-        selected_features <<- unique(c(.self$selected_features, top_feats))
-
-        # Get imputed data for selected features
-        X_train_sel <- X_imputed[rownames(X_train_raw), top_feats, drop = FALSE]
-        X_test_sel  <- X_imputed[rownames(X_test_raw), top_feats, drop = FALSE]
-
-        # Train logistic regression
-        train_df <- data.frame(X_train_sel, y = factor(y_train))
-        model <- glm(y ~ ., data = train_df, family = binomial(link = "logit"),
-                      control = list(maxit = 1000))
-        models[[length(models) + 1]] <<- model
-
-        # 5-fold CV for ROC
-        folds <- createFolds(y_train, k = 5, list = TRUE, returnTrain = TRUE)
-        cv_tprs <- matrix(nrow = 0, ncol = 100)
-
-        for (fold_train_idx in folds) {
-          fold_val_idx <- setdiff(seq_along(y_train), fold_train_idx)
-          cv_train_df <- data.frame(X_train_sel[fold_train_idx, , drop = FALSE],
-                                     y = factor(y_train[fold_train_idx]))
-          cv_val_df   <- X_train_sel[fold_val_idx, , drop = FALSE]
-          y_cv_val    <- y_train[fold_val_idx]
-
-          cv_model <- glm(y ~ ., data = cv_train_df, family = binomial(link = "logit"),
-                          control = list(maxit = 1000))
-          probas <- predict(cv_model, newdata = cv_val_df, type = "response")
-
-          if (length(unique(y_cv_val)) > 1) {
-            roc_obj <- roc(y_cv_val, probas, quiet = TRUE)
-            interp_tpr <- approx(1 - roc_obj$specificities, roc_obj$sensitivities,
-                                  xout = mean_fpr, rule = 2)$y
-            interp_tpr[1] <- 0
-            cv_tprs <- rbind(cv_tprs, interp_tpr)
-          }
-        }
-
-        # Predict on test set
-        test_probs <- predict(model, newdata = X_test_sel, type = "response")
-        if (length(unique(y_test)) > 1) {
-          test_roc <- roc(y_test, test_probs, quiet = TRUE)
-          auc_val <- as.numeric(auc(test_roc))
-        } else {
-          auc_val <- NA
-        }
-        aucs <- c(aucs, auc_val)
-
-        if (nrow(cv_tprs) > 0) {
-          mean_tpr_fold <- colMeans(cv_tprs)
-          mean_tpr_fold[100] <- 1.0
-          all_tprs <- rbind(all_tprs, mean_tpr_fold)
+      for (res in run_results) {
+        if (is.null(res)) next
+        models[[length(models) + 1]] <<- res$model
+        selected_features <<- unique(c(.self$selected_features, res$top_feats))
+        aucs <- c(aucs, res$auc)
+        if (!is.null(res$mean_tpr)) {
+          all_tprs <- rbind(all_tprs, res$mean_tpr)
         }
       }
 
@@ -246,26 +330,43 @@ AdaptmsClassifierDF <- setRefClass(
 
     classify_dataframe = function(validation_df, validation_cat_df) {
       shared_ids <- intersect(rownames(validation_df), rownames(validation_cat_df))
+      if (length(.self$selected_features) == 0) {
+        stop("No selected features available. Run 'classify_and_plot' first.")
+      }
+
+      selected_feature_order <- unique(.self$selected_features)
+      model_cache <- new.env(parent = emptyenv())
 
       for (idx in shared_ids) {
         row_data <- validation_df[idx, , drop = FALSE]
-        non_na_cols <- colnames(row_data)[!is.na(row_data[1, ])]
-        available_features <- intersect(.self$selected_features, non_na_cols)
+        aligned_row <- rep(NA_real_, length(selected_feature_order))
+        names(aligned_row) <- selected_feature_order
+        common_cols <- intersect(selected_feature_order, colnames(row_data))
+        if (length(common_cols) > 0) {
+          aligned_row[common_cols] <- suppressWarnings(as.numeric(row_data[1, common_cols, drop = TRUE]))
+        }
+
+        available_features <- selected_feature_order[!is.na(aligned_row)]
         if (length(available_features) < 2) next
-        d_sample <- row_data[, available_features, drop = FALSE]
+        d_sample <- as.data.frame(t(aligned_row[available_features]), stringsAsFactors = FALSE)
+        colnames(d_sample) <- available_features
 
-        true_label <- validation_cat_df[idx, between]
+        true_label <- validation_cat_df[idx, between, drop = TRUE]
 
-        # Re-train model using stored training data with available features
-        X_train_filt <- .self$training_data[, available_features, drop = FALSE]
-        y_train_filt <- .self$training_targets
-
-        train_df <- data.frame(X_train_filt, y = factor(y_train_filt))
-        model <- tryCatch(
-          glm(y ~ ., data = train_df, family = binomial(link = "logit"),
-              control = list(maxit = 2000)),
-          error = function(e) NULL
-        )
+        feature_key <- paste(available_features, collapse = "\r")
+        if (exists(feature_key, envir = model_cache, inherits = FALSE)) {
+          model <- get(feature_key, envir = model_cache, inherits = FALSE)
+        } else {
+          X_train_filt <- .self$training_data[, available_features, drop = FALSE]
+          y_train_filt <- .self$training_targets
+          train_df <- data.frame(X_train_filt, y = factor(y_train_filt))
+          model <- tryCatch(
+            glm(y ~ ., data = train_df, family = binomial(link = "logit"),
+                control = list(maxit = 2000)),
+            error = function(e) NULL
+          )
+          assign(feature_key, model, envir = model_cache)
+        }
 
         if (!is.null(model)) {
           prob <- predict(model, newdata = d_sample, type = "response")
@@ -398,7 +499,8 @@ AdaptmsClassifierFolder <- setRefClass(
     predictions    = "list",
     feature_names  = "character",
     training_data  = "ANY",
-    training_targets = "ANY"
+    training_targets = "ANY",
+    sample_model_cache = "ANY"
   ),
   methods = list(
     initialize = function(prot_df, cat_df, gene_dict = NULL, between = NULL, cohort = NULL) {
@@ -414,9 +516,10 @@ AdaptmsClassifierFolder <- setRefClass(
       feature_names <<- colnames(prot_df)
       training_data <<- NULL
       training_targets <<- NULL
+      sample_model_cache <<- new.env(parent = emptyenv())
     },
 
-    classify_and_plot = function(category1, category2, n_runs = 10, topn_features = 50) {
+    classify_and_plot = function(category1, category2, n_runs = 10, topn_features = 50, n_jobs = 1) {
       if (between == "") {
         stop("No between variable given. Please provide a variable for classification.")
       }
@@ -459,89 +562,32 @@ AdaptmsClassifierFolder <- setRefClass(
 
       training_data <<- X_filt_imp
       training_targets <<- y_filt
+      sample_model_cache <<- new.env(parent = emptyenv())
 
       mean_fpr <- seq(0, 1, length.out = 100)
       all_tprs <- matrix(nrow = 0, ncol = 100)
       aucs <- numeric(0)
 
-      for (i in seq_len(n_runs)) {
-        set.seed(i - 1)
-        train_idx <- createDataPartition(factor(y_filt, levels = c(0, 1)),
-                                         p = 0.8, list = FALSE)[, 1]
+      run_results <- .parallel_lapply_adapt(
+        seq_len(n_runs),
+        function(i) .run_binary_logreg_iteration(
+          seed = i,
+          X_unimputed = X_filt_unimp,
+          X_imputed = X_filt_imp,
+          y_vec = y_filt,
+          topn_features = topn_features,
+          min_non_na = 2L
+        ),
+        n_jobs = n_jobs
+      )
 
-        X_train_unimp <- X_filt_unimp[train_idx, , drop = FALSE]
-        X_train_imp   <- X_filt_imp[train_idx, , drop = FALSE]
-        X_test_imp    <- X_filt_imp[-train_idx, , drop = FALSE]
-        y_train <- y_filt[train_idx]
-        y_test  <- y_filt[-train_idx]
-
-        # t-test feature selection on unimputed data
-        p_values <- sapply(colnames(X_train_unimp), function(col) {
-          g1 <- X_train_unimp[y_train == 0, col]
-          g2 <- X_train_unimp[y_train == 1, col]
-          g1 <- g1[!is.na(g1)]
-          g2 <- g2[!is.na(g2)]
-          if (length(g1) > 1 && length(g2) > 1) {
-            tryCatch(t.test(g1, g2)$p.value, error = function(e) 1.0)
-          } else {
-            1.0
-          }
-        })
-
-        corrected_p <- p.adjust(p_values, method = "BH")
-        top_idx <- order(corrected_p)[seq_len(min(topn_features, length(corrected_p)))]
-        top_feats <- colnames(X_train_unimp)[top_idx]
-        selected_features <<- unique(c(.self$selected_features, top_feats))
-
-        X_train_sel <- X_train_imp[, top_feats, drop = FALSE]
-        X_test_sel  <- X_test_imp[, top_feats, drop = FALSE]
-
-        train_df <- data.frame(X_train_sel, y = factor(y_train))
-        model <- glm(y ~ ., data = train_df, family = binomial(link = "logit"),
-                      control = list(maxit = 1000))
-        models[[length(models) + 1]] <<- model
-
-        # 5-fold CV
-        folds <- createFolds(y_train, k = 5, list = TRUE, returnTrain = TRUE)
-        cv_tprs <- matrix(nrow = 0, ncol = 100)
-
-        for (fold_train_idx in folds) {
-          fold_val_idx <- setdiff(seq_along(y_train), fold_train_idx)
-          cv_train_df <- data.frame(X_train_sel[fold_train_idx, , drop = FALSE],
-                                     y = factor(y_train[fold_train_idx]))
-          cv_val_df   <- X_train_sel[fold_val_idx, , drop = FALSE]
-          y_cv_val    <- y_train[fold_val_idx]
-
-          cv_model <- tryCatch(
-            glm(y ~ ., data = cv_train_df, family = binomial(link = "logit"),
-                control = list(maxit = 1000)),
-            error = function(e) NULL
-          )
-          if (!is.null(cv_model)) {
-            probas <- predict(cv_model, newdata = cv_val_df, type = "response")
-            if (length(unique(y_cv_val)) > 1) {
-              roc_obj <- roc(y_cv_val, probas, quiet = TRUE)
-              interp_tpr <- approx(1 - roc_obj$specificities, roc_obj$sensitivities,
-                                    xout = mean_fpr, rule = 2)$y
-              interp_tpr[1] <- 0
-              cv_tprs <- rbind(cv_tprs, interp_tpr)
-            }
-          }
-        }
-
-        test_probs <- predict(model, newdata = X_test_sel, type = "response")
-        if (length(unique(y_test)) > 1) {
-          test_roc <- roc(y_test, test_probs, quiet = TRUE)
-          auc_val <- as.numeric(auc(test_roc))
-        } else {
-          auc_val <- NA
-        }
-        aucs <- c(aucs, auc_val)
-
-        if (nrow(cv_tprs) > 0) {
-          mean_tpr_fold <- colMeans(cv_tprs)
-          mean_tpr_fold[100] <- 1.0
-          all_tprs <- rbind(all_tprs, mean_tpr_fold)
+      for (res in run_results) {
+        if (is.null(res)) next
+        models[[length(models) + 1]] <<- res$model
+        selected_features <<- unique(c(.self$selected_features, res$top_feats))
+        aucs <- c(aucs, res$auc)
+        if (!is.null(res$mean_tpr)) {
+          all_tprs <- rbind(all_tprs, res$mean_tpr)
         }
       }
 
@@ -574,20 +620,31 @@ AdaptmsClassifierFolder <- setRefClass(
         stop("No trained models available. Run 'classify_and_plot' first.")
       }
 
-      available_features <- intersect(.self$selected_features, colnames(d_sample))
+      available_features <- .self$selected_features[.self$selected_features %in% colnames(d_sample)]
       if (length(available_features) < 2) return(invisible(NULL))
       d_sample_filt <- d_sample[, available_features, drop = FALSE]
       d_sample_filt[is.na(d_sample_filt)] <- 0
 
-      X_train_filt <- .self$training_data[, available_features, drop = FALSE]
-      y_train_filt <- .self$training_targets
+      feature_key <- paste(available_features, collapse = "\r")
+      cache_env <- .self$sample_model_cache
+      if (!is.environment(cache_env)) {
+        cache_env <- new.env(parent = emptyenv())
+        sample_model_cache <<- cache_env
+      }
 
-      train_df <- data.frame(X_train_filt, y = factor(y_train_filt))
-      model <- tryCatch(
-        glm(y ~ ., data = train_df, family = binomial(link = "logit"),
-            control = list(maxit = 1000)),
-        error = function(e) NULL
-      )
+      if (exists(feature_key, envir = cache_env, inherits = FALSE)) {
+        model <- get(feature_key, envir = cache_env, inherits = FALSE)
+      } else {
+        X_train_filt <- .self$training_data[, available_features, drop = FALSE]
+        y_train_filt <- .self$training_targets
+        train_df <- data.frame(X_train_filt, y = factor(y_train_filt))
+        model <- tryCatch(
+          glm(y ~ ., data = train_df, family = binomial(link = "logit"),
+              control = list(maxit = 1000)),
+          error = function(e) NULL
+        )
+        assign(feature_key, model, envir = cache_env)
+      }
 
       if (!is.null(model)) {
         prob <- predict(model, newdata = d_sample_filt, type = "response")

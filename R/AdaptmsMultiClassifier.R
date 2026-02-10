@@ -10,6 +10,62 @@ library(pROC)
 library(VIM)
 library(nnet)
 
+.resolve_n_jobs_multi <- function(n_jobs) {
+  nj <- suppressWarnings(as.integer(n_jobs))
+  if (is.na(nj)) nj <- 1L
+  if (nj <= 0L) {
+    detected <- suppressWarnings(parallel::detectCores(logical = FALSE))
+    if (is.na(detected) || detected < 1L) detected <- 1L
+    nj <- detected
+  }
+  nj
+}
+
+.parallel_lapply_multi <- function(X, FUN, n_jobs = 1L) {
+  nj <- .resolve_n_jobs_multi(n_jobs)
+  if (length(X) <= 1L || nj <= 1L || .Platform$OS.type == "windows") {
+    return(lapply(X, FUN))
+  }
+  parallel::mclapply(X, FUN, mc.cores = min(length(X), nj))
+}
+
+.numeric_matrix_multi <- function(df) {
+  as.matrix(data.frame(
+    lapply(df, function(x) suppressWarnings(as.numeric(as.character(x)))),
+    check.names = FALSE
+  ))
+}
+
+.welch_pvalues_pair <- function(group1_mat, group2_mat, min_non_na = 6L) {
+  n1 <- colSums(!is.na(group1_mat))
+  n2 <- colSums(!is.na(group2_mat))
+  valid <- n1 >= min_non_na & n2 >= min_non_na
+
+  m1 <- colMeans(group1_mat, na.rm = TRUE)
+  m2 <- colMeans(group2_mat, na.rm = TRUE)
+
+  centered1 <- sweep(group1_mat, 2, m1, FUN = "-")
+  centered2 <- sweep(group2_mat, 2, m2, FUN = "-")
+  centered1[is.na(centered1)] <- 0
+  centered2[is.na(centered2)] <- 0
+
+  v1 <- colSums(centered1 ^ 2) / pmax(n1 - 1, 1)
+  v2 <- colSums(centered2 ^ 2) / pmax(n2 - 1, 1)
+
+  se <- sqrt((v1 / pmax(n1, 1)) + (v2 / pmax(n2, 1)))
+  t_stat <- (m1 - m2) / se
+
+  df_num <- (v1 / pmax(n1, 1) + v2 / pmax(n2, 1)) ^ 2
+  df_den <- (v1 ^ 2) / (pmax(n1, 1) ^ 2 * pmax(n1 - 1, 1)) +
+    (v2 ^ 2) / (pmax(n2, 1) ^ 2 * pmax(n2 - 1, 1))
+  df <- df_num / df_den
+
+  p_values <- 2 * stats::pt(-abs(t_stat), df = df)
+  p_values[!is.finite(p_values)] <- 1.0
+  p_values[!valid] <- 1.0
+  as.numeric(p_values)
+}
+
 # -----------------------------------------------------------------------------
 # AdaptmsMulticlassClassifier
 # Multiclass extension using one-vs-rest logistic regression with per-sample
@@ -30,7 +86,8 @@ AdaptmsMulticlassClassifier <- setRefClass(
     feature_names     = "character",
     training_data     = "ANY",
     training_targets  = "ANY",
-    label_levels      = "character"
+    label_levels      = "character",
+    sample_model_cache = "ANY"
   ),
   methods = list(
     initialize = function(prot_df, cat_df, gene_dict = NULL, between_column) {
@@ -46,45 +103,41 @@ AdaptmsMulticlassClassifier <- setRefClass(
       training_data <<- NULL
       training_targets <<- NULL
       label_levels <<- character(0)
+      sample_model_cache <<- new.env(parent = emptyenv())
     },
 
     # --- Private: pairwise t-test feature selection on unimputed data ---
-    perform_feature_selection = function(X_df, y_vec, n_features_per_pair = 200) {
+    perform_feature_selection = function(X_df, y_vec, n_features_per_pair = 200, n_jobs = 1) {
       unique_labels <- sort(unique(y_vec))
       sel_feats <- character(0)
+      X_mat <- .numeric_matrix_multi(X_df)
+      pairs <- utils::combn(unique_labels, 2, simplify = FALSE)
+      col_names <- colnames(X_df)
 
-      for (i in seq_along(unique_labels)) {
-        for (j in seq_along(unique_labels)) {
-          if (j <= i) next
-          lab1 <- unique_labels[i]
-          lab2 <- unique_labels[j]
-
-          group1 <- X_df[y_vec == lab1, , drop = FALSE]
-          group2 <- X_df[y_vec == lab2, , drop = FALSE]
-
-          p_values <- sapply(colnames(X_df), function(feat) {
-            f1 <- group1[[feat]]
-            f2 <- group2[[feat]]
-            f1 <- f1[!is.na(f1)]
-            f2 <- f2[!is.na(f2)]
-            if (length(f1) > 5 && length(f2) > 5) {
-              tryCatch(t.test(f1, f2)$p.value, error = function(e) 1.0)
-            } else {
-              1.0
-            }
-          })
-
+      pair_features <- .parallel_lapply_multi(
+        pairs,
+        function(pair_lbl) {
+          lab1 <- pair_lbl[1]
+          lab2 <- pair_lbl[2]
+          group1 <- X_mat[y_vec == lab1, , drop = FALSE]
+          group2 <- X_mat[y_vec == lab2, , drop = FALSE]
+          p_values <- .welch_pvalues_pair(group1, group2, min_non_na = 6L)
           corrected_p <- p.adjust(p_values, method = "BH")
           top_idx <- order(corrected_p)[seq_len(min(n_features_per_pair, length(corrected_p)))]
-          sel_feats <- unique(c(sel_feats, colnames(X_df)[top_idx]))
-        }
+          col_names[top_idx]
+        },
+        n_jobs = n_jobs
+      )
+
+      for (pair_top in pair_features) {
+        sel_feats <- unique(c(sel_feats, pair_top))
       }
 
       selected_features <<- unique(c(.self$selected_features, sel_feats))
       return(sel_feats)
     },
 
-    classify_and_plot = function(categories = NULL, n_runs = 3, n_features = 100) {
+    classify_and_plot = function(categories = NULL, n_runs = 3, n_features = 100, n_jobs = 1) {
       # Merge on row names
       shared_ids <- intersect(rownames(.self$prot_df), rownames(.self$cat_df))
       d_ML <- cbind(.self$prot_df[shared_ids, , drop = FALSE],
@@ -121,6 +174,7 @@ AdaptmsMulticlassClassifier <- setRefClass(
       X_imputed <- as.data.frame(kNN(X_raw, k = 5, imp_var = FALSE))
       rownames(X_imputed) <- rownames(X_raw)
       training_data <<- X_imputed
+      sample_model_cache <<- new.env(parent = emptyenv())
 
       mean_fpr <- seq(0, 1, length.out = 100)
 
@@ -143,7 +197,8 @@ AdaptmsMulticlassClassifier <- setRefClass(
 
         # Feature selection on unimputed training data
         sel_feats <- perform_feature_selection(X_orig_train, y_train,
-                                               n_features_per_pair = n_features)
+                                               n_features_per_pair = n_features,
+                                               n_jobs = n_jobs)
 
         X_imp_train_sel <- X_imp_train[, sel_feats, drop = FALSE]
 
@@ -259,42 +314,69 @@ AdaptmsMulticlassClassifier <- setRefClass(
       }
 
       shared_ids <- intersect(rownames(validation_df), rownames(validation_cat_df))
+      selected_feature_order <- unique(.self$selected_features)
+      cache_env <- .self$sample_model_cache
+      if (!is.environment(cache_env)) {
+        cache_env <- new.env(parent = emptyenv())
+        sample_model_cache <<- cache_env
+      }
 
       for (idx in shared_ids) {
         row_data <- validation_df[idx, , drop = FALSE]
-        non_na_cols <- colnames(row_data)[!is.na(row_data[1, ])]
-        available_features <- intersect(.self$selected_features, non_na_cols)
+        aligned_row <- rep(NA_real_, length(selected_feature_order))
+        names(aligned_row) <- selected_feature_order
+        common_cols <- intersect(selected_feature_order, colnames(row_data))
+        if (length(common_cols) > 0) {
+          aligned_row[common_cols] <- suppressWarnings(as.numeric(row_data[1, common_cols, drop = TRUE]))
+        }
+        available_features <- selected_feature_order[!is.na(aligned_row)]
 
         if (length(available_features) < 5) {
           message(sprintf("Sample %s has too few available features. Skipping.", idx))
           next
         }
 
-        d_sample <- row_data[, available_features, drop = FALSE]
+        d_sample <- as.data.frame(t(aligned_row[available_features]), stringsAsFactors = FALSE)
+        colnames(d_sample) <- available_features
         true_label <- if (idx %in% rownames(validation_cat_df)) {
-          validation_cat_df[idx, between_column]
+          validation_cat_df[idx, between_column, drop = TRUE]
         } else {
           "Unknown"
         }
 
-        # Re-train model on stored training data with available features
-        X_train_filt <- .self$training_data[, available_features, drop = FALSE]
-        y_train_filt <- .self$training_targets
-
-        train_df <- data.frame(X_train_filt, y = factor(y_train_filt, levels = label_levels))
-        model <- tryCatch(
-          nnet::multinom(y ~ ., data = train_df, maxit = 10000, trace = FALSE),
-          error = function(e) NULL
-        )
+        feature_key <- paste(available_features, collapse = "\r")
+        if (exists(feature_key, envir = cache_env, inherits = FALSE)) {
+          model <- get(feature_key, envir = cache_env, inherits = FALSE)
+        } else {
+          X_train_filt <- .self$training_data[, available_features, drop = FALSE]
+          y_train_filt <- .self$training_targets
+          train_df <- data.frame(X_train_filt, y = factor(y_train_filt, levels = label_levels))
+          model <- tryCatch(
+            nnet::multinom(y ~ ., data = train_df, maxit = 10000, trace = FALSE),
+            error = function(e) NULL
+          )
+          assign(feature_key, model, envir = cache_env)
+        }
 
         if (!is.null(model)) {
           probs <- predict(model, newdata = d_sample, type = "probs")
-          if (is.null(dim(probs))) {
-            probs <- c(1 - probs, probs)
-            names(probs) <- label_levels
+          probs_vec <- if (is.null(dim(probs))) {
+            vals <- as.numeric(probs)
+            nm <- names(probs)
+            if (is.null(nm)) {
+              nm <- if (length(vals) == length(label_levels)) label_levels else tail(label_levels, length(vals))
+            }
+            names(vals) <- nm
+            vals
+          } else {
+            vals <- as.numeric(probs[1, ])
+            names(vals) <- colnames(probs)
+            vals
           }
+          full_probs <- setNames(rep(0, length(label_levels)), label_levels)
+          full_probs[names(probs_vec)] <- probs_vec
           predictions[[length(predictions) + 1]] <<- list(
-            sample = idx, true_label = true_label, probs = probs
+            sample = idx, true_label = true_label, probs = full_probs
           )
         }
 
@@ -315,6 +397,11 @@ AdaptmsMulticlassClassifier <- setRefClass(
 
       true_labels <- true_labels[known_idx]
       pred_probs_list <- lapply(known_idx, function(i) predictions[[i]]$probs)
+      prob_mat <- do.call(rbind, lapply(pred_probs_list, function(pr) {
+        out <- setNames(rep(0, length(label_levels)), label_levels)
+        out[names(pr)] <- as.numeric(pr)
+        out
+      }))
 
       unique_labels <- sort(unique(true_labels))
       colors <- grDevices::rainbow(length(unique_labels))
@@ -325,9 +412,11 @@ AdaptmsMulticlassClassifier <- setRefClass(
         lbl <- unique_labels[k]
         true_bin <- as.integer(true_labels == lbl)
 
-        prob_class <- sapply(pred_probs_list, function(pr) {
-          if (lbl %in% names(pr)) pr[lbl] else 0
-        })
+        prob_class <- if (lbl %in% colnames(prob_mat)) {
+          as.numeric(prob_mat[, lbl])
+        } else {
+          rep(0, nrow(prob_mat))
+        }
 
         if (length(unique(true_bin)) < 2) next
 

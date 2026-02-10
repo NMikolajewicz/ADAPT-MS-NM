@@ -2,7 +2,7 @@ import os
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from sklearn.model_selection import StratifiedKFold, train_test_split, cross_val_score
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.impute import KNNImputer
 from sklearn.metrics import roc_curve, roc_auc_score
 from sklearn.linear_model import LogisticRegression
@@ -11,6 +11,35 @@ from statsmodels.stats.multitest import multipletests
 import matplotlib.pyplot as plt
 from numpy import interp
 from sklearn.preprocessing import LabelEncoder
+from itertools import combinations
+from joblib import Parallel, delayed
+
+
+def _extract_label(value):
+    if isinstance(value, pd.Series):
+        return value.iloc[0]
+    if isinstance(value, np.ndarray):
+        return value[0]
+    return value
+
+
+def _top_features_for_pair(X_arr, y_arr, label1, label2, feature_names, n_features_per_pair, min_non_na=6):
+    group1 = X_arr[y_arr == label1]
+    group2 = X_arr[y_arr == label2]
+
+    with np.errstate(invalid='ignore'):
+        p_values = ttest_ind(group1, group2, axis=0, nan_policy='omit').pvalue
+
+    p_values = np.asarray(p_values, dtype=np.float64)
+    count1 = np.sum(~np.isnan(group1), axis=0)
+    count2 = np.sum(~np.isnan(group2), axis=0)
+    valid_mask = (count1 >= min_non_na) & (count2 >= min_non_na)
+    p_values[~np.isfinite(p_values)] = 1.0
+    p_values[~valid_mask] = 1.0
+
+    _, corrected_p_values, _, _ = multipletests(p_values, method='fdr_bh')
+    top_idx = np.argsort(corrected_p_values)[:n_features_per_pair]
+    return feature_names[top_idx].tolist()
 
 
 class AdaptmsMulticlassClassifier:
@@ -36,7 +65,7 @@ class AdaptmsMulticlassClassifier:
         self.label_encoder = LabelEncoder()
         self.between_column = between_column
         
-    def _perform_feature_selection(self, X_df, y_series, n_features_per_pair=200):
+    def _perform_feature_selection(self, X_df, y_series, n_features_per_pair=200, n_jobs=1):
         """
         Perform feature selection using pairwise t-tests between all category combinations
         on unimputed data.
@@ -51,52 +80,38 @@ class AdaptmsMulticlassClassifier:
         """
         unique_labels = np.unique(y_series)
         selected_features = set()
-        
-        # Perform pairwise t-tests between all category combinations
-        for i in range(len(unique_labels)):
-            for j in range(i + 1, len(unique_labels)):
-                label1, label2 = unique_labels[i], unique_labels[j]
-                
-                # Get data for both categories
-                mask1 = y_series == label1
-                mask2 = y_series == label2
-                group1 = X_df[mask1]
-                group2 = X_df[mask2]
-                
-                # Perform t-test for each feature
-                p_values = []
-                for feat_name in X_df.columns:
-                    # Extract non-NA values for this feature from both groups
-                    feat1 = group1[feat_name].dropna()
-                    feat2 = group2[feat_name].dropna()
-                    
-                    # Only perform t-test if we have enough data points
-                    if len(feat1) > 5 and len(feat2) > 5:
-                        t_stat, p_val = ttest_ind(feat1, feat2)
-                        p_values.append((feat_name, p_val))
-                    else:
-                        p_values.append((feat_name, 1.0))  # High p-value for features with insufficient data
-                
-                # Correct for multiple testing using FDR
-                feat_names, p_vals = zip(*p_values)
-                _, corrected_p_values, _, _ = multipletests(p_vals, method='fdr_bh')
-                
-                # Sort features by corrected p-values
-                sorted_features = [(feat, p) for feat, p in zip(feat_names, corrected_p_values)]
-                sorted_features.sort(key=lambda x: x[1])
-                
-                # Select top features for this pair
-                top_features = [feat for feat, _ in sorted_features[:n_features_per_pair]]
-                selected_features.update(top_features)
+        pairs = list(combinations(unique_labels, 2))
+        X_arr = X_df.to_numpy(dtype=np.float64, copy=False)
+        y_arr = np.asarray(y_series)
+        feature_names = X_df.columns.to_numpy()
+
+        if n_jobs == 1:
+            pair_results = [
+                _top_features_for_pair(
+                    X_arr, y_arr, label1, label2, feature_names, n_features_per_pair
+                )
+                for label1, label2 in pairs
+            ]
+        else:
+            pair_results = Parallel(n_jobs=n_jobs, prefer='threads')(
+                delayed(_top_features_for_pair)(
+                    X_arr, y_arr, label1, label2, feature_names, n_features_per_pair
+                )
+                for label1, label2 in pairs
+            )
+
+        for features in pair_results:
+            selected_features.update(features)
         
         # Update class-level selected features
         self.selected_features.update(selected_features)
         
         # Return indices of selected features in the original dataframe
-        selected_indices = [X_df.columns.get_loc(feat) for feat in selected_features if feat in X_df.columns]
-        return list(selected_features), selected_indices
+        selected_features_sorted = sorted(selected_features)
+        selected_indices = [X_df.columns.get_loc(feat) for feat in selected_features_sorted if feat in X_df.columns]
+        return selected_features_sorted, selected_indices
 
-    def classify_and_plot(self, categories=None, n_runs=3, n_features=100):
+    def classify_and_plot(self, categories=None, n_runs=3, n_features=100, n_jobs=1):
         """
         Perform classification and plot ROC curves for each class (one-vs-rest).
         
@@ -114,6 +129,8 @@ class AdaptmsMulticlassClassifier:
             d_ML_original = d_ML_original.loc[filtered_indices]
             y_original = y_original.loc[filtered_indices]
         
+        X_original = d_ML_original.drop(columns=[self.between_column]).apply(pd.to_numeric, errors='coerce')
+
         # Store training targets and fit label encoder
         self.training_targets = y_original
         self.label_encoder.fit(y_original)
@@ -121,11 +138,10 @@ class AdaptmsMulticlassClassifier:
         
         # Prepare imputed version for ML
         imputer = KNNImputer(n_neighbors=5)
-        X_imputed = imputer.fit_transform(d_ML_original.drop(columns=[self.between_column]))
+        X_imputed = imputer.fit_transform(X_original)
         
         # Store clean training data
-        self.training_data = pd.DataFrame(X_imputed, index=d_ML_original.index, 
-                                        columns=d_ML_original.drop(columns=[self.between_column]).columns)
+        self.training_data = pd.DataFrame(X_imputed, index=d_ML_original.index, columns=X_original.columns)
         
         mean_fpr = np.linspace(0, 1, 100)
         unique_labels = np.unique(y_original)
@@ -136,7 +152,7 @@ class AdaptmsMulticlassClassifier:
         for i in tqdm(range(n_runs)):
             # Split into training and test sets
             X_orig_train, X_orig_test, X_imp_train, X_imp_test, y_train, y_test = train_test_split(
-                d_ML_original.drop(columns=[self.between_column]),
+                X_original,
                 self.training_data,
                 y_original_encoded, 
                 test_size=0.2, 
@@ -145,8 +161,12 @@ class AdaptmsMulticlassClassifier:
             )
             
             # Perform feature selection on UNIMPUTED data
-            selected_feature_names, _ = self._perform_feature_selection(X_orig_train, 
-                                                        self.label_encoder.inverse_transform(y_train), n_features_per_pair=n_features)
+            selected_feature_names, _ = self._perform_feature_selection(
+                X_orig_train,
+                self.label_encoder.inverse_transform(y_train),
+                n_features_per_pair=n_features,
+                n_jobs=n_jobs
+            )
             
             # Use these selected features on the imputed data for ML
             X_imp_train_selected = X_imp_train[selected_feature_names]
@@ -224,41 +244,33 @@ class AdaptmsMulticlassClassifier:
         """
         if not self.selected_features:
             raise ValueError("No features selected. Run 'classify_and_plot' first.")
-            
-        for idx, row in tqdm(validation_df.iterrows()):
-            # Handle the validation sample
-            d_sample = row.to_frame().T
-            
-            # Find the intersection of:
-            # 1. Features selected from discovery
-            # 2. Features available in the validation sample (not NaN)
-            available_features = [feat for feat in self.selected_features 
-                                 if feat in d_sample.columns and not pd.isna(d_sample[feat].iloc[0])]
-            
-            # Skip samples with too few available features
-            if len(available_features) < 5:
+
+        selected_feature_list = sorted(self.selected_features)
+        feature_array = np.asarray(selected_feature_list, dtype=object)
+        validation_aligned = validation_df.reindex(columns=selected_feature_list).apply(pd.to_numeric, errors='coerce')
+
+        y_train_filtered = self.training_targets.dropna()
+        y_train_encoded = self.label_encoder.transform(y_train_filtered)
+        X_train_base = self.training_data.loc[y_train_filtered.index]
+        model_cache = {}
+
+        for idx, row in tqdm(validation_aligned.iterrows()):
+            row_values = row.to_numpy(dtype=np.float64, copy=False)
+            available_mask = ~np.isnan(row_values)
+            if np.sum(available_mask) < 5:
                 print(f"Sample {idx} has too few available features. Skipping.")
                 continue
-                
-            # Extract only non-NA values for this sample
-            d_sample = d_sample[available_features]
-            
-            # Get true label if available
-            true_label = validation_cat_df.loc[idx, self.between_column] if idx in validation_cat_df.index else "Unknown"
-            
-            # Re-train model using stored imputed training data but only with available features
-            X_train_filtered = self.training_data[available_features].copy()
-            y_train_filtered = self.training_targets.dropna()
-            X_train_filtered = X_train_filtered.loc[y_train_filtered.index]
-            
-            # Train model on discovery data with only these features
-            model = LogisticRegression(max_iter=10000)
-            # Encode labels for training
-            y_train_encoded = self.label_encoder.transform(y_train_filtered)
-            model.fit(X_train_filtered, y_train_encoded)
-            
-            # Predict probabilities for all classes (no imputation of validation sample)
-            probs = model.predict_proba(d_sample)[0]
+
+            available_features = tuple(feature_array[available_mask].tolist())
+            model = model_cache.get(available_features)
+            if model is None:
+                X_train_filtered = X_train_base.loc[:, list(available_features)]
+                model = LogisticRegression(max_iter=10000)
+                model.fit(X_train_filtered, y_train_encoded)
+                model_cache[available_features] = model
+
+            probs = model.predict_proba(row_values[available_mask].reshape(1, -1))[0]
+            true_label = _extract_label(validation_cat_df.loc[idx, self.between_column]) if idx in validation_cat_df.index else "Unknown"
             self.predictions.append((idx, true_label, probs))
             
     def plot_validation_roc(self):
@@ -273,8 +285,8 @@ class AdaptmsMulticlassClassifier:
         if not known_indices:
             raise ValueError("No samples with known labels in validation data.")
             
-        filtered_labels = [true_labels[i] for i in known_indices]
-        filtered_probs = [pred_probs[i] for i in known_indices]
+        filtered_labels = np.array([true_labels[i] for i in known_indices])
+        filtered_probs = np.vstack([pred_probs[i] for i in known_indices])
         
         unique_labels = np.unique(filtered_labels)
         
@@ -283,11 +295,14 @@ class AdaptmsMulticlassClassifier:
         
         # Calculate and plot ROC curve for each class
         for idx, (label, color) in enumerate(zip(unique_labels, colors)):
-            true_bin = (np.array(filtered_labels) == label).astype(int)
+            true_bin = (filtered_labels == label).astype(int)
             
             # Extract probabilities for this class
             class_idx = list(self.label_encoder.classes_).index(label) if label in self.label_encoder.classes_ else idx
-            pred_probs_class = np.array([p[class_idx] if class_idx < len(p) else 0 for p in filtered_probs])
+            if class_idx < filtered_probs.shape[1]:
+                pred_probs_class = filtered_probs[:, class_idx]
+            else:
+                pred_probs_class = np.zeros(filtered_probs.shape[0], dtype=np.float64)
             
             fpr, tpr, _ = roc_curve(true_bin, pred_probs_class)
             auc = roc_auc_score(true_bin, pred_probs_class)

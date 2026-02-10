@@ -2,15 +2,81 @@ import os
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from sklearn.model_selection import StratifiedKFold, train_test_split, cross_val_score
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.impute import KNNImputer
 from sklearn.metrics import roc_curve, roc_auc_score
 from sklearn.linear_model import LogisticRegression
 from scipy.stats import ttest_ind
 from statsmodels.stats.multitest import multipletests
 import matplotlib.pyplot as plt
-from numpy import interp
 from matplotlib.backends.backend_pdf import PdfPages
+from joblib import Parallel, delayed
+
+
+def _extract_label(value):
+    if isinstance(value, pd.Series):
+        return value.iloc[0]
+    if isinstance(value, np.ndarray):
+        return value[0]
+    return value
+
+
+def _vectorized_ttest_pvalues(X_df, y_series, min_non_na=1):
+    X_arr = X_df.to_numpy(dtype=np.float64, copy=False)
+    y_arr = y_series.to_numpy()
+
+    group0 = X_arr[y_arr == 0]
+    group1 = X_arr[y_arr == 1]
+
+    with np.errstate(invalid='ignore'):
+        p_values = ttest_ind(group0, group1, axis=0, nan_policy='omit').pvalue
+
+    p_values = np.asarray(p_values, dtype=np.float64)
+    count0 = np.sum(~np.isnan(group0), axis=0)
+    count1 = np.sum(~np.isnan(group1), axis=0)
+    valid_mask = (count0 >= min_non_na) & (count1 >= min_non_na)
+    p_values[~np.isfinite(p_values)] = 1.0
+    p_values[~valid_mask] = 1.0
+    return p_values
+
+
+def _run_logreg_iteration(seed, X_unimputed, X_imputed, y_filtered, topn_features, min_non_na, max_iter):
+    X_train_unimputed, X_test_unimputed, y_train, y_test = train_test_split(
+        X_unimputed, y_filtered, test_size=0.2, stratify=y_filtered, random_state=seed
+    )
+
+    p_values = _vectorized_ttest_pvalues(X_train_unimputed, y_train, min_non_na=min_non_na)
+    _, corrected_p_values, _, _ = multipletests(p_values, method='fdr_bh')
+
+    top_feature_indices = np.argsort(corrected_p_values)[:topn_features]
+    top_features = list(X_train_unimputed.columns[top_feature_indices])
+
+    X_train_selected = X_imputed.loc[X_train_unimputed.index, top_features].to_numpy()
+    X_test_selected = X_imputed.loc[X_test_unimputed.index, top_features].to_numpy()
+
+    y_train_arr = y_train.to_numpy()
+    y_test_arr = y_test.to_numpy()
+
+    mean_fpr = np.linspace(0, 1, 100)
+    cv = StratifiedKFold(n_splits=5)
+    tprs = []
+
+    for train_idx, val_idx in cv.split(X_train_selected, y_train_arr):
+        model_cv = LogisticRegression(max_iter=max_iter, random_state=seed)
+        model_cv.fit(X_train_selected[train_idx], y_train_arr[train_idx])
+        probas_cv = model_cv.predict_proba(X_train_selected[val_idx])[:, 1]
+        fpr, tpr, _ = roc_curve(y_train_arr[val_idx], probas_cv)
+        tpr_interp = np.interp(mean_fpr, fpr, tpr)
+        tpr_interp[0] = 0.0
+        tprs.append(tpr_interp)
+
+    model = LogisticRegression(max_iter=max_iter, random_state=seed)
+    model.fit(X_train_selected, y_train_arr)
+    auc = roc_auc_score(y_test_arr, model.predict_proba(X_test_selected)[:, 1])
+
+    mean_tpr = np.mean(tprs, axis=0)
+    mean_tpr[-1] = 1.0
+    return model, top_features, mean_tpr, auc
 
 class AdaptmsClassifierDF:
     def __init__(self, prot_df, cat_df, gene_dict=None, between=None):
@@ -26,7 +92,7 @@ class AdaptmsClassifierDF:
         self.training_targets = None  # Store training targets
         self.between = between
 
-    def classify_and_plot(self, category1, category2, n_runs=10, topn_features=50):
+    def classify_and_plot(self, category1, category2, n_runs=10, topn_features=50, n_jobs=1):
         if self.between == None:
             raise ValueError("No between variable given. Please provide a variable for classification.")
         # Merge the dataframes on the index
@@ -52,87 +118,40 @@ class AdaptmsClassifierDF:
         # Handle missing values using KNN Imputer for the entire dataset
         # (We'll still keep this for compatibility with other methods)
         imputer = KNNImputer(n_neighbors=5)
-        X = imputer.fit_transform(X_filtered)
+        X_imputed = pd.DataFrame(
+            imputer.fit_transform(X_filtered),
+            index=X_filtered.index,
+            columns=X_filtered.columns
+        )
 
         # Store clean training data
-        self.training_data = pd.DataFrame(X, index=X_filtered.index, columns=X_filtered.columns)
+        self.training_data = X_imputed
 
         mean_fpr = np.linspace(0, 1, 100)
         all_tprs = []
         aucs = []
 
-        for i in range(n_runs):
-            # Split into training and test sets
-            X_train, X_test, y_train, y_test = train_test_split(
-                X_filtered, y_filtered, test_size=0.2, stratify=y_filtered, random_state=i
+        run_indices = list(range(n_runs))
+        if n_jobs == 1:
+            run_results = [
+                _run_logreg_iteration(
+                    i, X_filtered, X_imputed, y_filtered, topn_features, min_non_na=1, max_iter=1000
+                )
+                for i in run_indices
+            ]
+        else:
+            run_results = Parallel(n_jobs=n_jobs, prefer='threads')(
+                delayed(_run_logreg_iteration)(
+                    i, X_filtered, X_imputed, y_filtered, topn_features, min_non_na=1, max_iter=1000
+                )
+                for i in run_indices
             )
 
-            # Perform multiple t-tests for feature selection on raw data (with NaNs)
-            group1 = X_train[y_train == 0]
-            group2 = X_train[y_train == 1]
-
-            # Perform t-tests with nan-omit policy
-            p_values = []
-            for col in X_train.columns:
-                g1_vals = group1[col].dropna()
-                g2_vals = group2[col].dropna()
-                if len(g1_vals) > 0 and len(g2_vals) > 0:
-                    p_values.append(ttest_ind(g1_vals, g2_vals)[1])
-                else:
-                    p_values.append(1.0)  # If no data in either group, assign high p-value
-
-            # Correct for multiple testing using FDR
-            _, corrected_p_values, _, _ = multipletests(p_values, method='fdr_bh')
-
-            # Select the top 20 features by p-value
-            top_feature_indices = np.argsort(corrected_p_values)[:topn_features]
-            top_features = list(X_train.columns[top_feature_indices])
-            self.selected_features.update(top_features)
-
-            # Get the imputed data for these features
-            # We need to map from the raw data to the imputed data indices
-            X_train_imputed_idx = [X_filtered.index.get_indexer([idx])[0] for idx in X_train.index]
-            X_test_imputed_idx = [X_filtered.index.get_indexer([idx])[0] for idx in X_test.index]
-
-            # Get the column indices for the selected features
-            col_indices = [X_filtered.columns.get_indexer([col])[0] for col in top_features]
-
-            # Extract the selected features from the imputed data
-            X_train_selected = X[X_train_imputed_idx][:, col_indices]
-            X_test_selected = X[X_test_imputed_idx][:, col_indices]
-
-            # Train logistic regression model
-            model = LogisticRegression(max_iter=1000, random_state=i)
+        for model, top_features, mean_tpr, auc in run_results:
             self.models.append(model)
-
-            # Perform cross-validation
-            cv = StratifiedKFold(n_splits=5)
-            tprs = []
-
-            # Convert to NumPy arrays for compatibility with scikit-learn
-            X_train_arr = np.array(X_train_selected)
-            y_train_arr = np.array(y_train)
-
-            for train_idx, val_idx in cv.split(X_train_arr, y_train_arr):
-                X_cv_train, X_cv_val = X_train_arr[train_idx], X_train_arr[val_idx]
-                y_cv_train, y_cv_val = y_train_arr[train_idx], y_train_arr[val_idx]
-
-                # Train and predict probabilities
-                model.fit(X_cv_train, y_cv_train)
-                probas_ = model.predict_proba(X_cv_val)
-                fpr, tpr, _ = roc_curve(y_cv_val, probas_[:, 1])
-                tprs.append(np.interp(mean_fpr, fpr, tpr))
-                tprs[-1][0] = 0.0
-
-            # Final train on the whole training set
-            model.fit(X_train_selected, y_train)
-
-            # Aggregate TPRs and AUCs
-            mean_tpr = np.mean(tprs, axis=0)
-            mean_tpr[-1] = 1.0
-            auc = roc_auc_score(y_test, model.predict_proba(X_test_selected)[:, 1])
-            aucs.append(auc)
+            self.selected_features.update(top_features)
             all_tprs.append(mean_tpr)
+            aucs.append(auc)
 
         # Aggregate TPRs for plotting
         all_tprs = np.array(all_tprs)
@@ -155,28 +174,32 @@ class AdaptmsClassifierDF:
         plt.show()
 
     def classify_dataframe(self, validation_df, validation_cat_df):
-        for idx, row in tqdm(validation_df.iterrows()):
-            d_sample = row.dropna().to_frame().T  # Convert to DataFrame and drop NaNs
-            available_features = list(self.selected_features.intersection(d_sample.columns))
-            d_sample = d_sample[available_features]
+        selected_feature_list = sorted(self.selected_features)
+        if not selected_feature_list:
+            raise ValueError("No selected features available. Run 'classify_and_plot' first.")
 
-            true_label_data = validation_cat_df.loc[idx, self.between]
-            if isinstance(true_label_data, pd.Series):
-                true_label = true_label_data.iloc[0]
-            elif isinstance(true_label_data, np.ndarray):
-                true_label = true_label_data[0]
-            else:
-                true_label = true_label_data
+        validation_aligned = validation_df.reindex(columns=selected_feature_list).apply(pd.to_numeric, errors='coerce')
+        y_train_filtered = self.training_targets.dropna()
+        X_train_base = self.training_data.loc[y_train_filtered.index]
+        model_cache = {}
+        feature_array = np.asarray(selected_feature_list, dtype=object)
 
-            # Re-train model using stored training data
-            X_train_filtered = self.training_data[available_features].copy()
-            y_train_filtered = self.training_targets.dropna()
-            X_train_filtered = X_train_filtered.loc[y_train_filtered.index]
+        for idx, row in tqdm(validation_aligned.iterrows()):
+            row_values = row.to_numpy(dtype=np.float64, copy=False)
+            available_mask = ~np.isnan(row_values)
+            if not np.any(available_mask):
+                continue
 
-            model = LogisticRegression(max_iter=2000).fit(X_train_filtered, y_train_filtered)
+            available_features = tuple(feature_array[available_mask].tolist())
+            model = model_cache.get(available_features)
+            if model is None:
+                X_train_filtered = X_train_base.loc[:, list(available_features)]
+                model = LogisticRegression(max_iter=2000).fit(X_train_filtered, y_train_filtered)
+                model_cache[available_features] = model
 
-            # Predict probability for the sample
-            prob = model.predict_proba(d_sample)[:, 1][0]
+            sample_values = row_values[available_mask].reshape(1, -1)
+            prob = model.predict_proba(sample_values)[:, 1][0]
+            true_label = _extract_label(validation_cat_df.loc[idx, self.between])
             self.predictions.append((idx, true_label, prob))
 
     def plot_validation_roc(self, category1, category2):
@@ -269,8 +292,9 @@ class AdaptmsClassifierFolder:
         self.training_targets = None  # Store training targets
         self.between = between
         self.cohort = cohort  # select cohorts by substring of raws
+        self._sample_model_cache = {}
 
-    def classify_and_plot(self, category1, category2, n_runs=10, topn_features=50):
+    def classify_and_plot(self, category1, category2, n_runs=10, topn_features=50, n_jobs=1):
         if self.between is None:
             raise ValueError("No between variable given. Please provide a variable for classification.")
         # Merge the dataframes on the index
@@ -303,56 +327,41 @@ class AdaptmsClassifierFolder:
         all_tprs = []
         aucs = []
 
-        for i in range(n_runs):
-            # Split into training and test sets
-            X_train_unimputed, X_test_unimputed, y_train, y_test = train_test_split(
-                X_filtered_unimputed, y_filtered, test_size=0.2, stratify=y_filtered, random_state=i
+        run_indices = list(range(n_runs))
+        if n_jobs == 1:
+            run_results = [
+                _run_logreg_iteration(
+                    i,
+                    X_filtered_unimputed,
+                    X_filtered_imputed,
+                    y_filtered,
+                    topn_features,
+                    min_non_na=2,
+                    max_iter=1000
+                )
+                for i in run_indices
+            ]
+        else:
+            run_results = Parallel(n_jobs=n_jobs, prefer='threads')(
+                delayed(_run_logreg_iteration)(
+                    i,
+                    X_filtered_unimputed,
+                    X_filtered_imputed,
+                    y_filtered,
+                    topn_features,
+                    min_non_na=2,
+                    max_iter=1000
+                )
+                for i in run_indices
             )
-            X_train_imputed, X_test_imputed = X_filtered_imputed.loc[X_train_unimputed.index], X_filtered_imputed.loc[X_test_unimputed.index]
 
-            # Perform multiple t-tests for feature selection
-            p_values = []
-            for col in X_train_unimputed.columns:
-                group1 = X_train_unimputed.loc[y_train == 0, col].dropna()
-                group2 = X_train_unimputed.loc[y_train == 1, col].dropna()
-                if len(group1) > 1 and len(group2) > 1:
-                    p_values.append(ttest_ind(group1, group2, nan_policy='omit')[1])
-                else:
-                    p_values.append(1.0)
-
-            # Correct for multiple testing using FDR
-            _, corrected_p_values, _, _ = multipletests(p_values, method='fdr_bh')
-
-            # Select the top 120 features by p-value
-            top_features = list(X_train_unimputed.columns[np.argsort(corrected_p_values)[:topn_features]])
-            self.selected_features.update(top_features)
-
-            X_train_selected = X_train_imputed[top_features]
-            X_test_selected = X_test_imputed[top_features]
-
-            # Train logistic regression classifier
-            model = LogisticRegression(max_iter=1000, random_state=i)
+        for model, top_features, mean_tpr, auc in run_results:
             self.models.append(model)
-
-            # Perform cross-validation
-            cv = StratifiedKFold(n_splits=5)
-            tprs = []
-            for train_idx, val_idx in cv.split(X_train_selected, y_train):
-                X_cv_train, X_cv_val = X_train_selected.iloc[train_idx], X_train_selected.iloc[val_idx]
-                y_cv_train, y_cv_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
-
-                # Train and predict probabilities
-                probas_ = model.fit(X_cv_train, y_cv_train).predict_proba(X_cv_val)
-                fpr, tpr, _ = roc_curve(y_cv_val, probas_[:, 1])
-                tprs.append(interp(mean_fpr, fpr, tpr))
-                tprs[-1][0] = 0.0
-
-            # Aggregate TPRs and AUCs
-            mean_tpr = np.mean(tprs, axis=0)
-            mean_tpr[-1] = 1.0
-            auc = roc_auc_score(y_test, model.predict_proba(X_test_selected)[:, 1])
-            aucs.append(auc)
+            self.selected_features.update(top_features)
             all_tprs.append(mean_tpr)
+            aucs.append(auc)
+
+        self._sample_model_cache = {}
 
         # Aggregate TPRs for plotting
         all_tprs = np.array(all_tprs)
@@ -379,16 +388,19 @@ class AdaptmsClassifierFolder:
             raise ValueError("No trained models available. Run 'classify_and_plot' first.")
 
         # Get intersection of selected features and available features in the sample
-        available_features = list(self.selected_features.intersection(d_sample.columns))
-        d_sample = d_sample[available_features].copy()
-        d_sample = d_sample.fillna(0)
+        available_features = tuple(sorted(self.selected_features.intersection(d_sample.columns)))
+        if not available_features:
+            return
+
+        d_sample = d_sample.loc[:, list(available_features)].fillna(0)
 
         # Re-train model using only available features from stored training data
-        X_train_filtered = self.training_data[available_features].copy()
         y_train_filtered = self.training_targets.dropna()
-        X_train_filtered = X_train_filtered.loc[y_train_filtered.index]
-
-        model = LogisticRegression(max_iter=1000).fit(X_train_filtered, y_train_filtered)
+        model = self._sample_model_cache.get(available_features)
+        if model is None:
+            X_train_filtered = self.training_data.loc[y_train_filtered.index, list(available_features)]
+            model = LogisticRegression(max_iter=1000).fit(X_train_filtered, y_train_filtered)
+            self._sample_model_cache[available_features] = model
 
         # Predict probability for the sample
         prob = model.predict_proba(d_sample)[:, 1][0]
