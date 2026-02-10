@@ -153,7 +153,7 @@ if (!exists(".adaptms_impute_dataset", mode = "function")) {
   X_train_sel <- X_imputed[rownames(X_train_raw), top_feats, drop = FALSE]
   X_test_sel <- X_imputed[rownames(X_test_raw), top_feats, drop = FALSE]
 
-  train_df <- data.frame(X_train_sel, y = factor(y_train))
+  train_df <- data.frame(X_train_sel, y = factor(y_train), check.names = FALSE)
   model <- tryCatch(
     glm(y ~ ., data = train_df, family = binomial(link = "logit"),
         control = list(maxit = 1000)),
@@ -174,7 +174,8 @@ if (!exists(".adaptms_impute_dataset", mode = "function")) {
   for (fold_train_idx in folds) {
     fold_val_idx <- setdiff(seq_along(y_train), fold_train_idx)
     cv_train_df <- data.frame(X_train_sel[fold_train_idx, , drop = FALSE],
-                              y = factor(y_train[fold_train_idx]))
+                              y = factor(y_train[fold_train_idx]),
+                              check.names = FALSE)
     cv_val_df <- X_train_sel[fold_val_idx, , drop = FALSE]
     y_cv_val <- y_train[fold_val_idx]
 
@@ -381,7 +382,7 @@ AdaptmsClassifierDF <- setRefClass(
         } else {
           X_train_filt <- .self$training_data[, available_features, drop = FALSE]
           y_train_filt <- .self$training_targets
-          train_df <- data.frame(X_train_filt, y = factor(y_train_filt))
+          train_df <- data.frame(X_train_filt, y = factor(y_train_filt), check.names = FALSE)
           model <- tryCatch(
             glm(y ~ ., data = train_df, family = binomial(link = "logit"),
                 control = list(maxit = 2000)),
@@ -658,7 +659,7 @@ AdaptmsClassifierFolder <- setRefClass(
       } else {
         X_train_filt <- .self$training_data[, available_features, drop = FALSE]
         y_train_filt <- .self$training_targets
-        train_df <- data.frame(X_train_filt, y = factor(y_train_filt))
+        train_df <- data.frame(X_train_filt, y = factor(y_train_filt), check.names = FALSE)
         model <- tryCatch(
           glm(y ~ ., data = train_df, family = binomial(link = "logit"),
               control = list(maxit = 1000)),
