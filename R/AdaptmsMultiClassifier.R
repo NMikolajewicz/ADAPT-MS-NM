@@ -11,7 +11,21 @@ library(VIM)
 library(nnet)
 
 if (!exists(".adaptms_impute_dataset", mode = "function")) {
-  util_candidates <- c(file.path("R", "ImputationUtils.R"), "ImputationUtils.R")
+  util_candidates <- character(0)
+  if (requireNamespace("here", quietly = TRUE)) {
+    util_candidates <- c(util_candidates, file.path(here::here(), "R", "ImputationUtils.R"))
+  }
+
+  source_file <- tryCatch({
+    of <- sys.frame(1)$ofile
+    if (is.null(of)) "" else normalizePath(of, winslash = "/", mustWork = FALSE)
+  }, error = function(e) "")
+  if (nzchar(source_file)) {
+    util_candidates <- c(util_candidates, file.path(dirname(source_file), "ImputationUtils.R"))
+  }
+
+  util_candidates <- c(util_candidates, file.path("R", "ImputationUtils.R"), "ImputationUtils.R")
+  util_candidates <- unique(util_candidates[nzchar(util_candidates)])
   util_path <- util_candidates[file.exists(util_candidates)][1]
   if (is.na(util_path)) {
     stop("Missing required utility file: R/ImputationUtils.R")
