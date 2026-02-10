@@ -120,7 +120,7 @@ NonRefitClassifier <- setRefClass(
         X_test_sel  <- X_test[, top_feats, drop = FALSE]
 
         # Train logistic regression
-        train_df <- data.frame(X_train_sel, y = factor(y_train))
+        train_df <- data.frame(X_train_sel, y = factor(y_train), check.names = FALSE)
         model <- glm(y ~ ., data = train_df, family = binomial(link = "logit"),
                       control = list(maxit = 1000))
         models[[length(models) + 1]] <<- model
@@ -132,7 +132,8 @@ NonRefitClassifier <- setRefClass(
         for (fold_train_idx in folds) {
           fold_val_idx <- setdiff(seq_along(y_train), fold_train_idx)
           cv_train_df <- data.frame(X_train_sel[fold_train_idx, , drop = FALSE],
-                                     y = factor(y_train[fold_train_idx]))
+                                     y = factor(y_train[fold_train_idx]),
+                                     check.names = FALSE)
           cv_val_df   <- X_train_sel[fold_val_idx, , drop = FALSE]
           y_cv_val    <- y_train[fold_val_idx]
 
