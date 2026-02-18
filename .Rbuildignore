@@ -1,0 +1,13 @@
+^\\.DS_Store$
+^\\.Rhistory$
+^\\.Rproj\\.user$
+^ADAPT-MS-NM\\.Rproj$
+^\\.git$
+^\\.gitignore$
+^pyproject\\.toml$
+^requirements\\.txt$
+^utils$
+^notebooks$
+^notebooks_R$
+^data$
+^Rplots\\.pdf$

@@ -1,41 +1,42 @@
 # =============================================================================
 # install_dependencies.R
-# Install all R packages required by the ADAPT-MS R pipeline
-# Run this script once before using the classifiers:
-#   source("R/install_dependencies.R")
+# Convenience helpers for installing packages used by ADAPT-MS workflows.
 # =============================================================================
 
-install_if_missing <- function(pkg) {
-  if (!requireNamespace(pkg, quietly = TRUE)) {
-    message(sprintf("Installing %s...", pkg))
-    install.packages(pkg, repos = "https://cloud.r-project.org")
-  } else {
-    message(sprintf("  %s already installed.", pkg))
-  }
+.adaptms_runtime_packages <- function() {
+  c(
+    "caret",
+    "randomForest",
+    "xgboost",
+    "nnet",
+    "pROC",
+    "VIM",
+    "RANN",
+    "ggplot2"
+  )
 }
 
-message("=== ADAPT-MS R: Installing dependencies ===\n")
+.adaptms_optional_packages <- function() {
+  c("readxl", "readr", "rmarkdown", "knitr")
+}
 
-# Core data manipulation
-install_if_missing("readxl")       # Read Excel files (.xlsx)
-install_if_missing("readr")        # Fast CSV/TSV reading
+install_if_missing <- function(pkg, repos = "https://cloud.r-project.org") {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    message(sprintf("Installing %s ...", pkg))
+    install.packages(pkg, repos = repos)
+  } else {
+    message(sprintf("%s is already installed.", pkg))
+  }
+  invisible(pkg)
+}
 
-# Machine learning & statistics
-install_if_missing("glmnet")       # Logistic regression (regularized)
-install_if_missing("caret")        # ML utilities (stratified splits, CV folds)
-install_if_missing("randomForest") # Random Forest for feature selection
-install_if_missing("xgboost")      # XGBoost classifier
-install_if_missing("nnet")         # Multinomial logistic regression
-install_if_missing("pROC")         # ROC curves and AUC computation
-install_if_missing("VIM")          # KNN imputation (kNN function)
+install_adaptms_dependencies <- function(include_optional = TRUE,
+                                         repos = "https://cloud.r-project.org") {
+  pkgs <- .adaptms_runtime_packages()
+  if (isTRUE(include_optional)) {
+    pkgs <- c(pkgs, .adaptms_optional_packages())
+  }
 
-# Plotting
-install_if_missing("ggplot2")      # Publication-quality plots
-
-# Notebooks
-install_if_missing("rmarkdown")    # R Markdown rendering
-install_if_missing("knitr")        # Notebook chunk execution
-
-message("\n=== All dependencies installed successfully. ===")
-message("You can now source the classifier files, e.g.:")
-message('  source("R/AdaptmsClassifier.R")')
+  message("Installing ADAPT-MS dependencies")
+  invisible(lapply(pkgs, install_if_missing, repos = repos))
+}

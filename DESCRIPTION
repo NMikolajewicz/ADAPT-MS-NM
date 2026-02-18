@@ -1,0 +1,40 @@
+Package: ADAPTMSNM
+Type: Package
+Title: ADAPT-MS Classifiers for Proteomics Data
+Version: 0.0.1
+Authors@R:
+    person(given = "Johannes B.",
+           family = "Mueller-Reif",
+           role = c("aut", "cre"),
+           email = "adaptms@example.org")
+Description: R implementations of the ADAPT-MS classifier family, including
+    baseline, non-refit, and adaptive per-sample refitting workflows for
+    proteomics analyses.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Depends:
+    R (>= 4.1.0)
+Imports:
+    methods,
+    caret,
+    pROC,
+    randomForest,
+    xgboost,
+    nnet,
+    VIM,
+    RANN,
+    ggplot2
+Suggests:
+    readr,
+    readxl,
+    rmarkdown,
+    knitr
+Collate:
+    'ImputationUtils.R'
+    'AdaptmsClassifier.R'
+    'AdaptmsMultiClassifier.R'
+    'BaselineClassifier.R'
+    'NonRefitClassifier.R'
+    'NonValClassifier.R'
+    'XGBfillClassifier.R'
+    'install_dependencies.R'
