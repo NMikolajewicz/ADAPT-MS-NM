@@ -21,14 +21,28 @@
 
 The `R/` directory contains a full R port of the ADAPT-MS pipeline. All six classifier architectures are faithfully translated, preserving the same statistical methods, feature selection, imputation, and per-sample refitting logic.
 
+### Install R Package From GitHub
+
+```r
+# Install helper (once)
+install.packages("remotes")
+
+# Install ADAPT-MS package from GitHub
+remotes::install_github("NMikolajewicz/ADAPT-MS-NM")
+
+# Load package
+library(ADAPTMSNM)
+```
+
 ### Quick Start (R)
 
 ```r
-# 1. Install dependencies (run once)
-source("R/install_dependencies.R")
+# 1. Install package from GitHub (once)
+install.packages("remotes")
+remotes::install_github("NMikolajewicz/ADAPT-MS-NM")
 
-# 2. Source a classifier
-source("R/AdaptmsClassifier.R")
+# 2. Load package
+library(ADAPTMSNM)
 
 # 3. Load your data
 prot_df <- read.delim("data/your_proteomics.tsv", sep = "\t", check.names = FALSE)
@@ -44,7 +58,15 @@ classifier$save_plots_to_pdf("results.pdf")
 
 ### R Dependencies
 
-Install all at once with `source("R/install_dependencies.R")`, or manually:
+Dependencies are installed automatically when you install the package.
+
+If needed, you can also install the full optional set manually:
+
+```r
+ADAPTMSNM::install_adaptms_dependencies(include_optional = TRUE)
+```
+
+Runtime and optional packages used by the project:
 
 | R Package | Purpose | Python Equivalent |
 |-----------|---------|-------------------|

@@ -38,3 +38,4 @@ Collate:
     'NonValClassifier.R'
     'XGBfillClassifier.R'
     'install_dependencies.R'
+RoxygenNote: 7.3.3

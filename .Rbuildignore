@@ -11,3 +11,4 @@
 ^notebooks_R$
 ^data$
 ^Rplots\\.pdf$
+^\.Rproj\.user$
